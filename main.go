@@ -14,7 +14,7 @@ import (
 )
 
 type ConfigEntry struct {
-	Type string `json:"type"`
+	Type string `json:"provider"`
 	Key  string `json:"key"`
 }
 
