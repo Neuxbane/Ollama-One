@@ -11,10 +11,19 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 )
 
 type GeminiProvider struct {
 	BaseProvider
+	BaseURL string
+}
+
+func (p *GeminiProvider) getBaseURL() string {
+	if p.BaseURL != "" {
+		return strings.TrimSuffix(p.BaseURL, "/")
+	}
+	return "https://generativelanguage.googleapis.com"
 }
 
 type geminiFunction struct {
@@ -88,72 +97,96 @@ type geminiResponse struct {
 
 func (p *GeminiProvider) ListModels(ctx context.Context) ([]ModelInfo, error) {
 	key := p.GetNextKey()
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models?key=%s", key)
-
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, err
+	if key == "" {
+		log.Printf("[Gemini] ListModels error: no API key found")
+		return nil, fmt.Errorf("no gemini api key configured")
 	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("gemini api error: %s", string(body))
-	}
-
-	var data struct {
-		Models []struct {
-			Name            string   `json:"name"`
-			DisplayName     string   `json:"displayName"`
-			InputTokenLimit int      `json:"inputTokenLimit"`
-			Thinking        bool     `json:"thinking"`
-			SupportedMethods []string `json:"supportedGenerationMethods"`
-		} `json:"models"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return nil, err
-	}
-
 	var models []ModelInfo
-	for _, m := range data.Models {
-		// Filter for models that support generating content
-		supportsChat := false
-		for _, method := range m.SupportedMethods {
-			if method == "generateContent" {
-				supportsChat = true
-				break
+	pageToken := ""
+
+	page := 1
+	for {
+		url := fmt.Sprintf("%s/v1beta/models?key=%s", p.getBaseURL(), key)
+		if pageToken != "" {
+			url += fmt.Sprintf("&pageToken=%s", pageToken)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			log.Printf("[Gemini] ListModels page %d request error: %v", page, err)
+			return nil, err
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			log.Printf("[Gemini] ListModels page %d HTTP error: %v", page, err)
+			return nil, err
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			log.Printf("[Gemini] ListModels page %d API error (status %d): %s", page, resp.StatusCode, string(body))
+			return nil, fmt.Errorf("gemini api error (status %d): %s", resp.StatusCode, string(body))
+		}
+
+		var data struct {
+			Models []struct {
+				Name             string   `json:"name"`
+				DisplayName      string   `json:"displayName"`
+				InputTokenLimit  int      `json:"inputTokenLimit"`
+				Thinking         bool     `json:"thinking"`
+				SupportedMethods []string `json:"supportedGenerationMethods"`
+			} `json:"models"`
+			NextPageToken string `json:"nextPageToken"`
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+			resp.Body.Close()
+			log.Printf("[Gemini] ListModels page %d JSON decode error: %v", page, err)
+			return nil, err
+		}
+		resp.Body.Close()
+
+		log.Printf("[Gemini] ListModels page %d fetched %d models from API", page, len(data.Models))
+
+		for _, m := range data.Models {
+			id := strings.TrimPrefix(m.Name, "models/")
+			caps := []string{"vision", "tools", "chat", "completion"}
+			if m.Thinking {
+				caps = append(caps, "thinking")
 			}
-		}
-		if !supportsChat {
-			continue
+
+			models = append(models, ModelInfo{
+				ID:           id,
+				Name:         m.DisplayName,
+				ContextSize:  170000,
+				Capabilities: caps,
+			})
 		}
 
-		id := strings.TrimPrefix(m.Name, "models/")
-		caps := []string{"vision", "tools", "chat", "completion"}
-		if m.Thinking {
-			caps = append(caps, "thinking")
+		if data.NextPageToken == "" {
+			break
 		}
-
-		models = append(models, ModelInfo{
-			ID:           id,
-			Name:         m.DisplayName,
-			ContextSize:  170000,
-			Capabilities: caps,
-		})
+		pageToken = data.NextPageToken
+		page++
 	}
 
+	log.Printf("[Gemini] ListModels completed: %d generateContent models total", len(models))
 	return models, nil
 }
 
 func (p *GeminiProvider) Chat(ctx context.Context, req *CompletionRequest, onChunk func(*CompletionResponse)) (*CompletionResponse, error) {
 	key := p.GetNextKey()
-	
+	modelLower := strings.ToLower(req.Model)
+
+	if strings.Contains(modelLower, "antigravity") {
+		return p.handleAntigravityInteraction(ctx, key, req, onChunk)
+	}
+	if strings.Contains(modelLower, "live") {
+		return p.handleLiveModel(ctx, key, req, onChunk)
+	}
+
 	// Prepare request body
 	gemReq := geminiRequest{
 		Contents: make([]geminiContent, len(req.Messages)),
@@ -271,7 +304,7 @@ func (p *GeminiProvider) Chat(ctx context.Context, req *CompletionRequest, onChu
 				funcs = append(funcs, geminiFunction{
 					Name:        f.Name,
 					Description: f.Description,
-					Parameters:  f.Parameters,
+					Parameters:  sanitizeGeminiSchemaMap(f.Parameters),
 				})
 			}
 			if len(funcs) > 0 {
@@ -292,7 +325,7 @@ func (p *GeminiProvider) Chat(ctx context.Context, req *CompletionRequest, onChu
 	}
 
 	// Always use streaming if possible
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:streamGenerateContent?alt=sse&key=%s", req.Model, key)
+	url := fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse&key=%s", p.getBaseURL(), req.Model, key)
 	
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
 	if err != nil {
@@ -791,4 +824,444 @@ func (p *GeminiProvider) fixToolCall(funcName string, args map[string]any, avail
 	}
 
 	return args, nil
+}
+
+func sanitizeGeminiSchemaMap(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
+	}
+	res := sanitizeGeminiSchema(m)
+	if resultMap, ok := res.(map[string]any); ok {
+		return resultMap
+	}
+	return m
+}
+
+func sanitizeGeminiSchema(val any) any {
+	switch v := val.(type) {
+	case map[string]any:
+		cleaned := make(map[string]any)
+		for k, child := range v {
+			// Remove schema properties that Google Gemini REST API rejects
+			switch k {
+			case "$comment", "$schema", "$id", "title", "enumDescriptions", "examples", "default", "additionalProperties":
+				continue
+			}
+			cleaned[k] = sanitizeGeminiSchema(child)
+		}
+
+		// Handle type arrays e.g. ["string", "null"] -> type: "string", nullable: true
+		if typeVal, exists := cleaned["type"]; exists {
+			if typeSlice, ok := typeVal.([]any); ok {
+				firstType := ""
+				isNullable := false
+				for _, t := range typeSlice {
+					if s, ok := t.(string); ok {
+						if s == "null" {
+							isNullable = true
+						} else if firstType == "" {
+							firstType = s
+						}
+					}
+				}
+				if firstType != "" {
+					cleaned["type"] = firstType
+				} else {
+					cleaned["type"] = "string"
+				}
+				if isNullable {
+					cleaned["nullable"] = true
+				}
+			}
+		}
+
+		// Validate required fields: every item in "required" MUST exist in "properties"
+		if reqVal, hasReq := cleaned["required"]; hasReq {
+			propsMap, _ := cleaned["properties"].(map[string]any)
+
+			var reqSlice []string
+			switch r := reqVal.(type) {
+			case []any:
+				for _, item := range r {
+					if s, ok := item.(string); ok {
+						reqSlice = append(reqSlice, s)
+					}
+				}
+			case []string:
+				reqSlice = r
+			}
+
+			if propsMap == nil || len(propsMap) == 0 {
+				delete(cleaned, "required")
+			} else {
+				validReq := make([]any, 0, len(reqSlice))
+				for _, reqKey := range reqSlice {
+					if _, exists := propsMap[reqKey]; exists {
+						validReq = append(validReq, reqKey)
+					}
+				}
+				if len(validReq) > 0 {
+					cleaned["required"] = validReq
+				} else {
+					delete(cleaned, "required")
+				}
+			}
+		}
+
+		return cleaned
+
+	case []any:
+		cleanedSlice := make([]any, len(v))
+		for i, item := range v {
+			cleanedSlice[i] = sanitizeGeminiSchema(item)
+		}
+		return cleanedSlice
+
+	default:
+		return val
+	}
+}
+
+func (p *GeminiProvider) handleAntigravityInteraction(ctx context.Context, key string, req *CompletionRequest, onChunk func(*CompletionResponse)) (*CompletionResponse, error) {
+	var inputBuilder strings.Builder
+	for _, msg := range req.Messages {
+		for _, part := range msg.Content {
+			if part.Type == ContentTypeText && part.Text != "" {
+				if inputBuilder.Len() > 0 {
+					inputBuilder.WriteString("\n")
+				}
+				inputBuilder.WriteString(part.Text)
+			}
+		}
+	}
+
+	payload := map[string]any{
+		"agent":      req.Model,
+		"input":      inputBuilder.String(),
+		"background": true,
+		"tools": []map[string]any{
+			{"type": "code_execution"},
+			{"type": "google_search"},
+			{"type": "url_context"},
+		},
+		"environment": map[string]any{
+			"type":    "remote",
+			"network": "disabled",
+		},
+	}
+
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	createURL := fmt.Sprintf("%s/v1beta/interactions?key=%s", p.getBaseURL(), key)
+	log.Printf("[Gemini Antigravity] Creating interaction for model %s via %s", req.Model, createURL)
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", createURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("gemini interaction api error (%d): %s", resp.StatusCode, string(body))
+	}
+
+	var createResp map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&createResp); err != nil {
+		return nil, err
+	}
+
+	interactionID, _ := createResp["id"].(string)
+	if interactionID == "" {
+		if name, ok := createResp["name"].(string); ok {
+			interactionID = strings.TrimPrefix(name, "interactions/")
+		}
+	}
+
+	log.Printf("[Gemini Antigravity] Created interaction %s, starting streaming step poll...", interactionID)
+
+	pollURL := fmt.Sprintf("%s/v1beta/interactions/%s?key=%s", p.getBaseURL(), interactionID, key)
+	ticker := time.NewTicker(400 * time.Millisecond)
+	defer ticker.Stop()
+
+	var fullContent strings.Builder
+	var allToolCalls []ToolCall
+	lastStepProcessed := 0
+	inThought := false
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+			pReq, err := http.NewRequestWithContext(ctx, "GET", pollURL, nil)
+			if err != nil {
+				return nil, err
+			}
+
+			pResp, err := http.DefaultClient.Do(pReq)
+			if err != nil {
+				return nil, err
+			}
+
+			var pData map[string]any
+			err = json.NewDecoder(pResp.Body).Decode(&pData)
+			pResp.Body.Close()
+			if err != nil {
+				continue
+			}
+
+			status, _ := pData["status"].(string)
+
+			// Process new steps incrementally for live streaming
+			if steps, ok := pData["steps"].([]any); ok {
+				for i := lastStepProcessed; i < len(steps); i++ {
+					stepMap, ok := steps[i].(map[string]any)
+					if !ok {
+						continue
+					}
+					stepType, _ := stepMap["type"].(string)
+
+					switch stepType {
+					case "thought":
+						var thoughtText string
+						if summaries, ok := stepMap["summary"].([]any); ok {
+							for _, sum := range summaries {
+								if sm, ok := sum.(map[string]any); ok {
+									if txt, ok := sm["text"].(string); ok {
+										thoughtText += txt
+									}
+								}
+							}
+						}
+						if thoughtText != "" {
+							if !inThought {
+								header := "<think>\n"
+								fullContent.WriteString(header)
+								if onChunk != nil {
+									onChunk(&CompletionResponse{Content: header})
+								}
+								inThought = true
+							}
+							fullContent.WriteString(thoughtText)
+							if onChunk != nil {
+								onChunk(&CompletionResponse{Content: thoughtText})
+							}
+						}
+
+					case "model_output":
+						if inThought {
+							closing := "\n</think>\n\n"
+							fullContent.WriteString(closing)
+							if onChunk != nil {
+								onChunk(&CompletionResponse{Content: closing})
+							}
+							inThought = false
+						}
+
+						var outputText string
+						if contents, ok := stepMap["content"].([]any); ok {
+							for _, c := range contents {
+								if cm, ok := c.(map[string]any); ok {
+									if txt, ok := cm["text"].(string); ok {
+										outputText += txt
+									}
+								}
+							}
+						}
+						if outputText != "" {
+							fullContent.WriteString(outputText)
+							if onChunk != nil {
+								onChunk(&CompletionResponse{Content: outputText})
+							}
+						}
+
+					case "tool_call", "function_call", "tool_use":
+						if inThought {
+							closing := "\n</think>\n\n"
+							fullContent.WriteString(closing)
+							if onChunk != nil {
+								onChunk(&CompletionResponse{Content: closing})
+							}
+							inThought = false
+						}
+
+						funcName := ""
+						var funcArgs map[string]any
+
+						if fc, ok := stepMap["function_call"].(map[string]any); ok {
+							funcName, _ = fc["name"].(string)
+							if args, ok := fc["args"].(map[string]any); ok {
+								funcArgs = args
+							} else if args, ok := fc["arguments"].(map[string]any); ok {
+								funcArgs = args
+							}
+						} else if tc, ok := stepMap["tool_call"].(map[string]any); ok {
+							funcName, _ = tc["name"].(string)
+							if args, ok := tc["args"].(map[string]any); ok {
+								funcArgs = args
+							}
+						} else if fn, ok := stepMap["name"].(string); ok {
+							funcName = fn
+							if args, ok := stepMap["args"].(map[string]any); ok {
+								funcArgs = args
+							}
+						}
+
+						if funcName != "" {
+							if funcArgs == nil {
+								funcArgs = make(map[string]any)
+							}
+							argsBytes, _ := json.Marshal(funcArgs)
+							toolCall := ToolCall{
+								ID:   fmt.Sprintf("call_interaction_%d", i),
+								Type: "function",
+								Function: FunctionCall{
+									Name:      funcName,
+									Arguments: string(argsBytes),
+								},
+							}
+							allToolCalls = append(allToolCalls, toolCall)
+							log.Printf("[Gemini Antigravity] Tool Call step %d: %s(%s)", i, funcName, string(argsBytes))
+							if onChunk != nil {
+								onChunk(&CompletionResponse{ToolCalls: []ToolCall{toolCall}})
+							}
+						}
+					}
+					lastStepProcessed = i + 1
+				}
+			}
+
+			if status == "completed" || status == "DONE" || status == "SUCCEEDED" {
+				if inThought {
+					closing := "\n</think>\n\n"
+					fullContent.WriteString(closing)
+					if onChunk != nil {
+						onChunk(&CompletionResponse{Content: closing})
+					}
+					inThought = false
+				}
+				log.Printf("[Gemini Antigravity] Interaction %s completed with %d tool call(s)", interactionID, len(allToolCalls))
+				return &CompletionResponse{
+					Content:   fullContent.String(),
+					ToolCalls: allToolCalls,
+				}, nil
+			} else if status == "failed" || status == "FAILED" || status == "ERROR" {
+				errDetail, _ := json.Marshal(pData["error"])
+				return nil, fmt.Errorf("gemini interaction failed: %s", string(errDetail))
+			}
+		}
+	}
+}
+
+func extractInteractionOutput(data map[string]any) string {
+	if outputs, ok := data["outputs"].([]any); ok {
+		var sb strings.Builder
+		for _, out := range outputs {
+			if m, ok := out.(map[string]any); ok {
+				if text, ok := m["text"].(string); ok {
+					sb.WriteString(text)
+				}
+			}
+		}
+		if sb.Len() > 0 {
+			return sb.String()
+		}
+	}
+	if text, ok := data["response"].(string); ok {
+		return text
+	}
+	return ""
+}
+
+func (p *GeminiProvider) handleLiveModel(ctx context.Context, key string, req *CompletionRequest, onChunk func(*CompletionResponse)) (*CompletionResponse, error) {
+	log.Printf("[Gemini Live] Handling live model session request for %s", req.Model)
+
+	gemReq := geminiRequest{
+		Contents: make([]geminiContent, len(req.Messages)),
+	}
+
+	for i, msg := range req.Messages {
+		role := msg.Role
+		if role == "assistant" {
+			role = "model"
+		} else if role != "user" {
+			role = "user"
+		}
+		parts := make([]geminiPart, 0)
+		for _, p := range msg.Content {
+			if p.Text != "" {
+				parts = append(parts, geminiPart{Text: p.Text})
+			}
+		}
+		gemReq.Contents[i] = geminiContent{Role: role, Parts: parts}
+	}
+
+	bodyBytes, err := json.Marshal(gemReq)
+	if err != nil {
+		return nil, err
+	}
+
+	url := fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse&key=%s", p.getBaseURL(), req.Model, key)
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("gemini live api error (%d): %s", resp.StatusCode, string(body))
+	}
+
+	fullContent := ""
+	reader := bufio.NewReader(resp.Body)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, err
+		}
+
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		data := strings.TrimPrefix(line, "data: ")
+		var gemResp geminiResponse
+		if err := json.Unmarshal([]byte(data), &gemResp); err != nil {
+			continue
+		}
+
+		for _, cand := range gemResp.Candidates {
+			for _, part := range cand.Content.Parts {
+				if part.Text != "" {
+					fullContent += part.Text
+					if onChunk != nil {
+						onChunk(&CompletionResponse{Content: part.Text})
+					}
+				}
+			}
+		}
+	}
+
+	return &CompletionResponse{Content: fullContent}, nil
 }
