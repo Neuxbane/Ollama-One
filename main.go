@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,8 +15,16 @@ import (
 )
 
 type ConfigEntry struct {
-	Type string `json:"provider"`
-	Key  string `json:"key"`
+	Type     string `json:"type"`
+	Provider string `json:"provider"`
+	Key      string `json:"key"`
+}
+
+func (c ConfigEntry) GetType() string {
+	if c.Type != "" {
+		return c.Type
+	}
+	return c.Provider
 }
 
 type OllamaToolCallFunction struct {
@@ -27,6 +36,16 @@ type OllamaToolCall struct {
 	ID       string                 `json:"id,omitempty"`
 	Type     string                 `json:"type,omitempty"`
 	Function OllamaToolCallFunction `json:"function"`
+}
+
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (lrw *loggingResponseWriter) WriteHeader(code int) {
+	lrw.statusCode = code
+	lrw.ResponseWriter.WriteHeader(code)
 }
 
 type OpenAIToolCall struct {
@@ -136,6 +155,7 @@ type OpenAIChatCompletionRequest struct {
 var (
 	geminiProvider *providers.GeminiProvider
 	openaiProvider *providers.OpenAIProvider
+	providersMap   = make(map[string]providers.Provider)
 )
 
 func loadConfig(path string) ([]ConfigEntry, error) {
@@ -160,19 +180,30 @@ func main() {
 	var openaiKeys []string
 
 	for _, entry := range config {
-		switch entry.Type {
+		t := strings.ToLower(entry.GetType())
+		switch t {
 		case "gemini":
 			geminiKeys = append(geminiKeys, entry.Key)
 		case "openai":
 			openaiKeys = append(openaiKeys, entry.Key)
+		default:
+			log.Printf("[CONFIG] Warning: unknown provider type %q in config", entry.GetType())
 		}
 	}
 
-	geminiProvider = &providers.GeminiProvider{
-		BaseProvider: providers.BaseProvider{APIKeys: geminiKeys},
+	log.Printf("[CONFIG] Loaded %d Gemini key(s), %d OpenAI key(s) from config.json", len(geminiKeys), len(openaiKeys))
+
+	if len(geminiKeys) > 0 {
+		geminiProvider = &providers.GeminiProvider{
+			BaseProvider: providers.BaseProvider{APIKeys: geminiKeys},
+		}
+		providersMap["gemini"] = geminiProvider
 	}
-	openaiProvider = &providers.OpenAIProvider{
-		BaseProvider: providers.BaseProvider{APIKeys: openaiKeys},
+	if len(openaiKeys) > 0 {
+		openaiProvider = &providers.OpenAIProvider{
+			BaseProvider: providers.BaseProvider{APIKeys: openaiKeys},
+		}
+		providersMap["openai"] = openaiProvider
 	}
 
 	if _, err := os.Stat("log"); os.IsNotExist(err) {
@@ -217,48 +248,101 @@ func main() {
 	})
 
 	mux.HandleFunc("/api/tags", func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("[API] Listing models (/api/tags)...")
 		var allModels []OllamaModel
-		collect := func(p providers.Provider, family string) {
-			if p == nil {
-				return
-			}
+		for pName, p := range providersMap {
 			models, err := p.ListModels(r.Context())
 			if err != nil {
-				log.Printf("Error listing models for %s: %v", family, err)
-				return
+				log.Printf("[API] Error listing models for provider %s: %v", pName, err)
+				continue
 			}
+			log.Printf("[API] Provider %s returned %d models", pName, len(models))
 			for _, m := range models {
-				if len(allModels) >= 100 {
+				if len(allModels) >= 200 {
 					break
 				}
-				// Create a real SHA256 digest based on the ID (not used anymore, using spoofed)
-
+				namespacedName := fmt.Sprintf("%s/%s:latest", pName, m.ID)
 				allModels = append(allModels, OllamaModel{
-					Name:       m.ID + ":latest",
-					Model:      m.ID + ":latest",
+					Name:       namespacedName,
+					Model:      namespacedName,
 					ModifiedAt: "2026-04-08T00:06:52.567291895+07:00",
 					Size:       4683087332,
 					Digest:     "845dbda0ea48ed749caafd9e6037047aa19acfcfd82e704d7ca97d631a0b697e",
 					Details: ModelDetail{
 						ParentModel:       "",
 						Format:            "gguf",
-						Family:            "qwen2",
-						Families:          []string{"qwen2"},
+						Family:            pName,
+						Families:          []string{pName},
+						ParameterSize:     "7.6B",
+						QuantizationLevel: "Q4_K_M",
+					},
+				})
+				bareName := m.ID + ":latest"
+				allModels = append(allModels, OllamaModel{
+					Name:       bareName,
+					Model:      bareName,
+					ModifiedAt: "2026-04-08T00:06:52.567291895+07:00",
+					Size:       4683087332,
+					Digest:     "845dbda0ea48ed749caafd9e6037047aa19acfcfd82e704d7ca97d631a0b697e",
+					Details: ModelDetail{
+						ParentModel:       "",
+						Format:            "gguf",
+						Family:            pName,
+						Families:          []string{pName},
 						ParameterSize:     "7.6B",
 						QuantizationLevel: "Q4_K_M",
 					},
 				})
 			}
 		}
-		if len(geminiProvider.APIKeys) > 0 {
-			collect(geminiProvider, "gemini")
-		}
-		if len(openaiProvider.APIKeys) > 0 {
-			collect(openaiProvider, "openai")
-		}
+		log.Printf("[API] /api/tags returning %d model(s)", len(allModels))
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		data, _ := json.Marshal(OllamaTagsResponse{Models: allModels})
 		w.Write(data)
+	})
+
+	mux.HandleFunc("/api/ps", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Write([]byte(`{"models":[]}`))
+	})
+
+	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("[API] Listing models (/v1/models)...")
+		type openAIModel struct {
+			ID      string `json:"id"`
+			Object  string `json:"object"`
+			Created int64  `json:"created"`
+			OwnedBy string `json:"owned_by"`
+		}
+		var modelsList []openAIModel
+		for pName, p := range providersMap {
+			models, err := p.ListModels(r.Context())
+			if err != nil {
+				log.Printf("[API] Error listing models for provider %s: %v", pName, err)
+				continue
+			}
+			log.Printf("[API] Provider %s returned %d models", pName, len(models))
+			for _, m := range models {
+				modelsList = append(modelsList, openAIModel{
+					ID:      fmt.Sprintf("%s/%s", pName, m.ID),
+					Object:  "model",
+					Created: 1700000000,
+					OwnedBy: pName,
+				})
+				modelsList = append(modelsList, openAIModel{
+					ID:      m.ID,
+					Object:  "model",
+					Created: 1700000000,
+					OwnedBy: pName,
+				})
+			}
+		}
+		log.Printf("[API] /v1/models returning %d model(s)", len(modelsList))
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(w).Encode(map[string]any{
+			"object": "list",
+			"data":   modelsList,
+		})
 	})
 
 	mux.HandleFunc("/api/show", func(w http.ResponseWriter, r *http.Request) {
@@ -313,9 +397,8 @@ func main() {
 			content := extractOpenAITextContent(m.Content)
 			log.Printf("Client -> Proxy: [%s] %s", m.Role, content)
 		}
-		req.Model = normalizeModelName(req.Model)
-
-		provider := getProvider(req.Model)
+		provider, targetModel := getProvider(req.Model)
+		req.Model = targetModel
 		internalMessages := make([]providers.Message, len(req.Messages))
 		for i, m := range req.Messages {
 			internalMessages[i] = providers.Message{
@@ -463,39 +546,103 @@ func main() {
 	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, X-Requested-With, Ollama-Version, X-Ollama-Version")
+		reqHeaders := r.Header.Get("Access-Control-Request-Headers")
+		if reqHeaders != "" {
+			w.Header().Set("Access-Control-Allow-Headers", reqHeaders)
+		} else {
+			w.Header().Set("Access-Control-Allow-Headers", "*")
+		}
 		w.Header().Set("Access-Control-Expose-Headers", "Ollama-Version, X-Ollama-Version")
 		w.Header().Set("Ollama-Version", "0.11.8")
+
+		lrw := &loggingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
 		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusNoContent)
+			lrw.WriteHeader(http.StatusNoContent)
+			log.Printf("[HTTP] OPTIONS %s -> 204 (%v)", r.URL.Path, time.Since(start))
 			return
 		}
 		if r.URL.Path == "/favicon.ico" {
-			w.WriteHeader(http.StatusNotFound)
+			lrw.WriteHeader(http.StatusNotFound)
 			return
 		}
-		mux.ServeHTTP(w, r)
+
+		log.Printf("[HTTP] -> %s %s (from %s)", r.Method, r.URL.RequestURI(), r.RemoteAddr)
+		mux.ServeHTTP(lrw, r)
+		log.Printf("[HTTP] <- %s %s finished -> %d (%v)", r.Method, r.URL.RequestURI(), lrw.statusCode, time.Since(start))
 	})
 
-	fmt.Println("Ollama-One proxy starting on 127.0.0.1:11434...")
-	if err := http.ListenAndServe("127.0.0.1:11434", handler); err != nil {
-		fmt.Printf("Error starting server: %v\n", err)
+	portEnv := os.Getenv("PORT")
+	if portEnv == "" {
+		portEnv = os.Getenv("OLLAMA_PORT")
+	}
+
+	host := os.Getenv("HOST")
+	if host == "" {
+		host = "127.0.0.1"
+	}
+
+	portsToTry := []string{"11434", "11435"}
+	if portEnv != "" {
+		portsToTry = []string{portEnv}
+	}
+
+	for _, p := range portsToTry {
+		addr := fmt.Sprintf("%s:%s", host, p)
+		listener, err := net.Listen("tcp", addr)
+		if err == nil {
+			fmt.Printf("Ollama-One proxy starting on http://%s...\n", addr)
+			if err := http.Serve(listener, handler); err != nil {
+				fmt.Printf("Error running server: %v\n", err)
+			}
+			return
+		}
+		fmt.Printf("Port %s unavailable (%v), trying next port...\n", p, err)
 	}
 }
 
-func getProvider(model string) providers.Provider {
-	model = normalizeModelName(model)
-	switch {
-	case model == "gpt-4" || model == "gpt-4o" || model == "gpt-3.5-turbo":
-		return openaiProvider
-	case strings.HasPrefix(model, "gemini-") || strings.HasPrefix(model, "gemma-") || model == "gemma-":
-		return geminiProvider
-	default:
-		log.Printf("Warning: Model %q is not explicitly mapped to a provider, defaulting to OpenAI", model)
-		return openaiProvider
+func getProvider(model string) (providers.Provider, string) {
+	fullModel := strings.TrimSpace(model)
+	fullModel = strings.TrimSuffix(fullModel, ":latest")
+
+	// 1. Explicit Provider Namespace: {provider}/{modelName} or {provider}:{modelName}
+	// e.g. "gemini/gemini-2.0-flash", "openai/gpt-4o", "openrouter/gemini"
+	if idx := strings.IndexAny(fullModel, "/:"); idx != -1 {
+		providerPrefix := strings.ToLower(fullModel[:idx])
+		actualModelName := fullModel[idx+1:]
+		if p, ok := providersMap[providerPrefix]; ok {
+			log.Printf("[ROUTE] Explicit namespace %q -> Provider: %s, Target Model: %s", model, providerPrefix, actualModelName)
+			return p, actualModelName
+		}
 	}
+
+	// 2. Single active provider: route everything to it
+	if len(providersMap) == 1 {
+		for pName, p := range providersMap {
+			log.Printf("[ROUTE] Single active provider %q -> Model: %s", pName, fullModel)
+			return p, fullModel
+		}
+	}
+
+	// 3. Provider name prefix match
+	for pName, p := range providersMap {
+		if strings.HasPrefix(strings.ToLower(fullModel), pName) {
+			log.Printf("[ROUTE] Provider prefix match -> Provider: %s, Model: %s", pName, fullModel)
+			return p, fullModel
+		}
+	}
+
+	// 4. Default fallback to registered provider
+	for pName, p := range providersMap {
+		log.Printf("[ROUTE] Fallback -> Provider: %s, Model: %s", pName, fullModel)
+		return p, fullModel
+	}
+
+	log.Printf("[ROUTE] Warning: No active provider found for model %q, defaulting to geminiProvider", fullModel)
+	return geminiProvider, fullModel
 }
 
 func normalizeModelName(model string) string {
@@ -504,7 +651,8 @@ func normalizeModelName(model string) string {
 }
 
 func handleGenerate(w http.ResponseWriter, r *http.Request, req *OllamaGenerateRequest) {
-	provider := getProvider(req.Model)
+	provider, targetModel := getProvider(req.Model)
+	req.Model = targetModel
 	internalReq := &providers.CompletionRequest{
 		Model: req.Model,
 		Messages: []providers.Message{
@@ -561,7 +709,8 @@ func handleGenerate(w http.ResponseWriter, r *http.Request, req *OllamaGenerateR
 }
 
 func handleChat(w http.ResponseWriter, r *http.Request, req *OllamaChatRequest) {
-	provider := getProvider(req.Model)
+	provider, targetModel := getProvider(req.Model)
+	req.Model = targetModel
 
 	internalMessages := make([]providers.Message, len(req.Messages))
 	for i, m := range req.Messages {
