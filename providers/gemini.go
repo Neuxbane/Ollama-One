@@ -1184,84 +1184,8 @@ func extractInteractionOutput(data map[string]any) string {
 }
 
 func (p *GeminiProvider) handleLiveModel(ctx context.Context, key string, req *CompletionRequest, onChunk func(*CompletionResponse)) (*CompletionResponse, error) {
-	log.Printf("[Gemini Live] Handling live model session request for %s", req.Model)
-
-	gemReq := geminiRequest{
-		Contents: make([]geminiContent, len(req.Messages)),
-	}
-
-	for i, msg := range req.Messages {
-		role := msg.Role
-		if role == "assistant" {
-			role = "model"
-		} else if role != "user" {
-			role = "user"
-		}
-		parts := make([]geminiPart, 0)
-		for _, p := range msg.Content {
-			if p.Text != "" {
-				parts = append(parts, geminiPart{Text: p.Text})
-			}
-		}
-		gemReq.Contents[i] = geminiContent{Role: role, Parts: parts}
-	}
-
-	bodyBytes, err := json.Marshal(gemReq)
-	if err != nil {
-		return nil, err
-	}
-
-	url := fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse&key=%s", p.getBaseURL(), req.Model, key)
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("gemini live api error (%d): %s", resp.StatusCode, string(body))
-	}
-
-	fullContent := ""
-	reader := bufio.NewReader(resp.Body)
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, err
-		}
-
-		line = strings.TrimSpace(line)
-		if line == "" || !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-
-		data := strings.TrimPrefix(line, "data: ")
-		var gemResp geminiResponse
-		if err := json.Unmarshal([]byte(data), &gemResp); err != nil {
-			continue
-		}
-
-		for _, cand := range gemResp.Candidates {
-			for _, part := range cand.Content.Parts {
-				if part.Text != "" {
-					fullContent += part.Text
-					if onChunk != nil {
-						onChunk(&CompletionResponse{Content: part.Text})
-					}
-				}
-			}
-		}
-	}
-
-	return &CompletionResponse{Content: fullContent}, nil
+	log.Printf("[Gemini Live] Delegating live model request for %s to GeminiLiveProvider", req.Model)
+	liveProv := NewGeminiLiveProvider([]string{key})
+	return liveProv.Chat(ctx, req, onChunk)
 }
+
