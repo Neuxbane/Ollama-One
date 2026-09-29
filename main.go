@@ -153,9 +153,10 @@ type OpenAIChatCompletionRequest struct {
 }
 
 var (
-	geminiProvider *providers.GeminiProvider
-	openaiProvider *providers.OpenAIProvider
-	providersMap   = make(map[string]providers.Provider)
+	geminiProvider     *providers.GeminiProvider
+	geminiLiveProvider *providers.GeminiLiveProvider
+	openaiProvider     *providers.OpenAIProvider
+	providersMap       = make(map[string]providers.Provider)
 )
 
 func loadConfig(path string) ([]ConfigEntry, error) {
@@ -177,6 +178,7 @@ func main() {
 	}
 
 	var geminiKeys []string
+	var geminiLiveKeys []string
 	var openaiKeys []string
 
 	for _, entry := range config {
@@ -184,6 +186,8 @@ func main() {
 		switch t {
 		case "gemini":
 			geminiKeys = append(geminiKeys, entry.Key)
+		case "gemini-live", "live", "geminilive":
+			geminiLiveKeys = append(geminiLiveKeys, entry.Key)
 		case "openai":
 			openaiKeys = append(openaiKeys, entry.Key)
 		default:
@@ -191,7 +195,21 @@ func main() {
 		}
 	}
 
-	log.Printf("[CONFIG] Loaded %d Gemini key(s), %d OpenAI key(s) from config.json", len(geminiKeys), len(openaiKeys))
+	// If no specific gemini-live keys configured, share geminiKeys if available
+	if len(geminiLiveKeys) == 0 && len(geminiKeys) > 0 {
+		geminiLiveKeys = append(geminiLiveKeys, geminiKeys...)
+	}
+	// Fallback to GEMINI_API_KEY environment variable if keys are empty
+	if envKey := os.Getenv("GEMINI_API_KEY"); envKey != "" {
+		if len(geminiKeys) == 0 {
+			geminiKeys = append(geminiKeys, envKey)
+		}
+		if len(geminiLiveKeys) == 0 {
+			geminiLiveKeys = append(geminiLiveKeys, envKey)
+		}
+	}
+
+	log.Printf("[CONFIG] Loaded %d Gemini key(s), %d Gemini Live key(s), %d OpenAI key(s)", len(geminiKeys), len(geminiLiveKeys), len(openaiKeys))
 
 	if len(geminiKeys) > 0 {
 		geminiProvider = &providers.GeminiProvider{
@@ -199,12 +217,17 @@ func main() {
 		}
 		providersMap["gemini"] = geminiProvider
 	}
+	if len(geminiLiveKeys) > 0 {
+		geminiLiveProvider = providers.NewGeminiLiveProvider(geminiLiveKeys)
+		providersMap["gemini-live"] = geminiLiveProvider
+	}
 	if len(openaiKeys) > 0 {
 		openaiProvider = &providers.OpenAIProvider{
 			BaseProvider: providers.BaseProvider{APIKeys: openaiKeys},
 		}
 		providersMap["openai"] = openaiProvider
 	}
+
 
 	if _, err := os.Stat("log"); os.IsNotExist(err) {
 		os.Mkdir("log", 0755)
@@ -361,6 +384,8 @@ func main() {
 		family := "gemini"
 		if strings.HasPrefix(id, "gpt-") {
 			family = "openai"
+		} else if strings.Contains(id, "live") || strings.Contains(id, "native-audio") {
+			family = "gemini-live"
 		}
 
 		resp := OllamaShowResponse{
@@ -609,17 +634,28 @@ func getProvider(model string) (providers.Provider, string) {
 	fullModel = strings.TrimSuffix(fullModel, ":latest")
 
 	// 1. Explicit Provider Namespace: {provider}/{modelName} or {provider}:{modelName}
-	// e.g. "gemini/gemini-2.0-flash", "openai/gpt-4o", "openrouter/gemini"
+	// e.g. "gemini/gemini-2.0-flash", "openai/gpt-4o", "gemini-live/gemini-3.1-flash-live-preview", "live/gemini-3.1-flash-live-preview"
 	if idx := strings.IndexAny(fullModel, "/:"); idx != -1 {
 		providerPrefix := strings.ToLower(fullModel[:idx])
 		actualModelName := fullModel[idx+1:]
+		if (providerPrefix == "live" || providerPrefix == "gemini-live") && geminiLiveProvider != nil {
+			log.Printf("[ROUTE] Explicit namespace %q -> Provider: gemini-live, Target Model: %s", model, actualModelName)
+			return geminiLiveProvider, actualModelName
+		}
 		if p, ok := providersMap[providerPrefix]; ok {
 			log.Printf("[ROUTE] Explicit namespace %q -> Provider: %s, Target Model: %s", model, providerPrefix, actualModelName)
 			return p, actualModelName
 		}
 	}
 
-	// 2. Single active provider: route everything to it
+	// 2. Gemini Live model detection by model name pattern
+	modelLower := strings.ToLower(fullModel)
+	if geminiLiveProvider != nil && (strings.Contains(modelLower, "live") || strings.Contains(modelLower, "native-audio")) {
+		log.Printf("[ROUTE] Live model pattern match -> Provider: gemini-live, Model: %s", fullModel)
+		return geminiLiveProvider, fullModel
+	}
+
+	// 3. Single active provider: route everything to it
 	if len(providersMap) == 1 {
 		for pName, p := range providersMap {
 			log.Printf("[ROUTE] Single active provider %q -> Model: %s", pName, fullModel)
@@ -627,7 +663,7 @@ func getProvider(model string) (providers.Provider, string) {
 		}
 	}
 
-	// 3. Provider name prefix match
+	// 4. Provider name prefix match
 	for pName, p := range providersMap {
 		if strings.HasPrefix(strings.ToLower(fullModel), pName) {
 			log.Printf("[ROUTE] Provider prefix match -> Provider: %s, Model: %s", pName, fullModel)
@@ -635,7 +671,7 @@ func getProvider(model string) (providers.Provider, string) {
 		}
 	}
 
-	// 4. Default fallback to registered provider
+	// 5. Default fallback to registered provider
 	for pName, p := range providersMap {
 		log.Printf("[ROUTE] Fallback -> Provider: %s, Model: %s", pName, fullModel)
 		return p, fullModel
