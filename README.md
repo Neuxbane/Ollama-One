@@ -2,6 +2,27 @@
 
 Ollama-One acts as a proxy connecting to models like Gemini, mimicking the Ollama API.
 
+## Instalasi
+
+### Prasyarat
+
+Buat file `config.json` menggunakan `config.example.json` sebagai contoh.
+
+### Jalankan Secara Lokal
+
+Pastikan Go telah terinstal.
+
+```bash
+go build -o ollama-one .
+./ollama-one
+```
+
+### Jalankan dengan Docker
+
+```bash
+docker compose up -d
+```
+
 ## Setup
 
 Follow these steps to configure Ollama-One:
@@ -16,9 +37,9 @@ Here is a preview of the chat interface:
 
 ![Chat Screenshot](assets/chatScreenshoot.png)
 
-## Extended Thinking Configuration
+## Konfigurasi VS Code
 
-For VS Code Copilot or OpenAI-compatible custom endpoints with Extended Thinking support:
+Untuk VS Code Copilot atau custom endpoint yang kompatibel dengan OpenAI yang mendukung Extended Thinking, gunakan konfigurasi berikut:
 
 ![Extended Thinking](assets/extended_thinking.png)
 
@@ -51,21 +72,6 @@ For VS Code Copilot or OpenAI-compatible custom endpoints with Extended Thinking
       "url": "http://127.0.0.1:11434/v1/chat/completions",
       "toolCalling": true,
       "vision": true,
-      "maxInputTokens": 128000,
-      "maxOutputTokens": 16000
-    },
-    {
-      "id": "gemini-3.1-flash-live-preview",
-      "name": "Gemini 3.1 Flash Live Preview",
-      "url": "http://127.0.0.1:11434/v1/chat/completions",
-      "toolCalling": true,
-      "vision": true,
-      "supportsReasoningEffort": [
-        "low",
-        "medium",
-        "high"
-      ],
-      "reasoningEffortFormat": "chat-completions",
       "maxInputTokens": 128000,
       "maxOutputTokens": 16000
     }
