@@ -79,9 +79,11 @@ type ThinkingConfig struct {
 
 // Message represents a single message in a chat conversation
 type Message struct {
-	Role      string        `json:"role"`
-	Content   []ContentPart `json:"content"`
-	ToolCalls []ToolCall    `json:"tool_calls,omitempty"`
+	Role       string        `json:"role"`
+	Name       string        `json:"name,omitempty"`
+	ToolCallID string        `json:"tool_call_id,omitempty"`
+	Content    []ContentPart `json:"content"`
+	ToolCalls  []ToolCall    `json:"tool_calls,omitempty"`
 }
 
 // CompletionRequest defines the input for a chat completion

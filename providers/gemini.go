@@ -41,6 +41,7 @@ type geminiFunctionCall struct {
 type geminiFunctionResponse struct {
 	Name     string         `json:"name"`
 	Response map[string]any `json:"response"`
+	ID       string         `json:"id,omitempty"`
 }
 
 type geminiPart struct {
@@ -187,26 +188,45 @@ func (p *GeminiProvider) Chat(ctx context.Context, req *CompletionRequest, onChu
 		return p.handleLiveModel(ctx, key, req, onChunk)
 	}
 
-	// Prepare request body
-	gemReq := geminiRequest{
-		Contents: make([]geminiContent, len(req.Messages)),
+	// Prepare system instruction and contents
+	var systemInstructions []string
+	if req.SystemInstruction != "" {
+		systemInstructions = append(systemInstructions, req.SystemInstruction)
 	}
 
-	if req.SystemInstruction != "" {
-		gemReq.SystemInstruction = &geminiContent{
-			Parts: []geminiPart{{Text: req.SystemInstruction}},
+	var chatMessages []Message
+	for _, msg := range req.Messages {
+		if msg.Role == "system" || msg.Role == "developer" {
+			for _, part := range msg.Content {
+				if part.Text != "" {
+					systemInstructions = append(systemInstructions, part.Text)
+				}
+			}
+		} else {
+			chatMessages = append(chatMessages, msg)
 		}
 	}
 
-	for i, msg := range req.Messages {
+	// Prepare request body
+	gemReq := geminiRequest{
+		Contents: make([]geminiContent, len(chatMessages)),
+	}
+
+	if len(systemInstructions) > 0 {
+		gemReq.SystemInstruction = &geminiContent{
+			Parts: []geminiPart{{Text: strings.Join(systemInstructions, "\n\n")}},
+		}
+	}
+
+	for i, msg := range chatMessages {
 		role := msg.Role
 		switch role {
 		case "assistant":
 			role = "model"
-		case "system", "developer", "":
-			role = "user"
 		case "tool":
-			role = "function" // Gemini uses 'function' role for tool results (often mapped to 'user' in some SDKs, but let's handle parts carefully)
+			role = "function" // Gemini uses 'function' role for tool results
+		default:
+			role = "user"
 		}
 		
 		gemReq.Contents[i] = geminiContent{
@@ -216,7 +236,11 @@ func (p *GeminiProvider) Chat(ctx context.Context, req *CompletionRequest, onChu
 		// Handle ToolCalls from previous assistant messages
 		for _, tc := range msg.ToolCalls {
 			var args map[string]any
-			if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+			if tc.Function.Arguments != "" {
+				if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+					args = make(map[string]any)
+				}
+			} else {
 				args = make(map[string]any)
 			}
 			gemReq.Contents[i].Parts = append(gemReq.Contents[i].Parts, geminiPart{
@@ -228,27 +252,59 @@ func (p *GeminiProvider) Chat(ctx context.Context, req *CompletionRequest, onChu
 			})
 		}
 
+		// Resolve function name for tool responses
+		funcName := msg.Name
+		if role == "function" {
+			if funcName == "" && msg.ToolCallID != "" {
+				// Search backwards for the tool call with matching ID
+				for j := i - 1; j >= 0; j-- {
+					for _, tc := range chatMessages[j].ToolCalls {
+						if tc.ID == msg.ToolCallID {
+							funcName = tc.Function.Name
+							break
+						}
+					}
+					if funcName != "" {
+						break
+					}
+				}
+			}
+			if funcName == "" {
+				// Fallback: search backwards for any tool call
+				for j := i - 1; j >= 0; j-- {
+					if len(chatMessages[j].ToolCalls) > 0 {
+						funcName = chatMessages[j].ToolCalls[0].Function.Name
+						break
+					}
+				}
+			}
+			// Clean prefix noise
+			for _, pfx := range []string{"tool_use:", "tool_code:", "tool_call:", "call:"} {
+				funcName = strings.TrimPrefix(funcName, pfx)
+			}
+			if funcName == "" {
+				funcName = "unknown"
+			}
+		}
+
 		for _, part := range msg.Content {
 			p := geminiPart{}
 			switch part.Type {
 			case ContentTypeText:
 				if role == "function" {
-					// This is a tool result. Map it to FunctionResponse.
-					// We need to find the tool call ID. 
-					// For Ollama/OpenAI, it's often in the message content or a separate field.
-					// Assuming the tool call name matches the function name.
-					p.FunctionResponse = &geminiFunctionResponse{
-						Name: "unknown", // Will be fixed below if possible
-						Response: map[string]any{
-							"result": part.Text,
-						},
-					}
-					// Try to parse as JSON if it looks like one
+					respMap := map[string]any{"result": part.Text}
 					var jsonResult any
 					if err := json.Unmarshal([]byte(part.Text), &jsonResult); err == nil {
-						p.FunctionResponse.Response = map[string]any{
-							"result": jsonResult,
+						if m, ok := jsonResult.(map[string]any); ok {
+							respMap = m
+						} else {
+							respMap = map[string]any{"result": jsonResult}
 						}
+					}
+					p.FunctionResponse = &geminiFunctionResponse{
+						Name:     funcName,
+						Response: respMap,
+						ID:       msg.ToolCallID,
 					}
 				} else {
 					p.Text = part.Text
@@ -270,47 +326,32 @@ func (p *GeminiProvider) Chat(ctx context.Context, req *CompletionRequest, onChu
 				gemReq.Contents[i].Parts = append(gemReq.Contents[i].Parts, p)
 			}
 		}
-
-		// If it's a tool result, we need to ensure the Name is correct.
-		// In a session-based approach, we'd look up the last tool call.
-		if role == "function" {
-			// Find the last model message with a tool call
-			for j := i - 1; j >= 0; j-- {
-				if gemReq.Contents[j].Role == "model" {
-					for _, p := range gemReq.Contents[j].Parts {
-						if p.FunctionCall != nil {
-							for k := range gemReq.Contents[i].Parts {
-								if gemReq.Contents[i].Parts[k].FunctionResponse != nil {
-									gemReq.Contents[i].Parts[k].FunctionResponse.Name = p.FunctionCall.Name
-								}
-							}
-						}
-					}
-					break
-				}
-			}
-		}
 	}
 
+	var allFuncs []geminiFunction
 	for _, tool := range req.Tools {
 		if tool.GoogleSearch {
 			gemReq.Tools = append(gemReq.Tools, geminiTool{
 				GoogleSearch: make(map[string]any),
 			})
 		}
-		if len(tool.Functions) > 0 {
-			var funcs []geminiFunction
-			for _, f := range tool.Functions {
-				funcs = append(funcs, geminiFunction{
-					Name:        f.Name,
-					Description: f.Description,
-					Parameters:  sanitizeGeminiSchemaMap(f.Parameters),
-				})
-			}
-			if len(funcs) > 0 {
-				gemReq.Tools = append(gemReq.Tools, geminiTool{FunctionDeclarations: funcs})
-			}
+		for _, f := range tool.Functions {
+			allFuncs = append(allFuncs, geminiFunction{
+				Name:        f.Name,
+				Description: f.Description,
+				Parameters:  sanitizeGeminiSchemaMap(f.Parameters),
+			})
 		}
+		if len(tool.Functions) == 0 && tool.Name != "" {
+			allFuncs = append(allFuncs, geminiFunction{
+				Name:        tool.Name,
+				Description: tool.Description,
+				Parameters:  sanitizeGeminiSchemaMap(tool.Parameters),
+			})
+		}
+	}
+	if len(allFuncs) > 0 {
+		gemReq.Tools = append(gemReq.Tools, geminiTool{FunctionDeclarations: allFuncs})
 	}
 
 	if req.Thinking != nil {
@@ -546,8 +587,12 @@ func (p *GeminiProvider) Chat(ctx context.Context, req *CompletionRequest, onChu
 					
 					log.Printf("FIXED Standard Tool Call: %s(%s)", funcName, string(argsBytes))
 
+					tcID := part.FunctionCall.ID
+					if tcID == "" {
+						tcID = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), len(allToolCalls))
+					}
 					toolCall := ToolCall{
-						ID:   part.FunctionCall.ID,
+						ID:   tcID,
 						Type: "function",
 						Function: FunctionCall{
 							Name:      funcName,

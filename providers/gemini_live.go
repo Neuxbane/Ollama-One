@@ -341,14 +341,14 @@ func (p *GeminiLiveProvider) Chat(ctx context.Context, req *CompletionRequest, o
 				funcDecls = append(funcDecls, geminiFunction{
 					Name:        fn.Name,
 					Description: fn.Description,
-					Parameters:  fn.Parameters,
+					Parameters:  sanitizeGeminiSchemaMap(fn.Parameters),
 				})
 			}
 			if tool.Name != "" && len(tool.Functions) == 0 {
 				funcDecls = append(funcDecls, geminiFunction{
 					Name:        tool.Name,
 					Description: tool.Description,
-					Parameters:  tool.Parameters,
+					Parameters:  sanitizeGeminiSchemaMap(tool.Parameters),
 				})
 			}
 		}
