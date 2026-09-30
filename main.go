@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -46,12 +48,6 @@ type loggingResponseWriter struct {
 func (lrw *loggingResponseWriter) WriteHeader(code int) {
 	lrw.statusCode = code
 	lrw.ResponseWriter.WriteHeader(code)
-}
-
-type OpenAIToolCall struct {
-	ID       string                 `json:"id"`
-	Type     string                 `json:"type"`
-	Function OllamaToolCallFunction `json:"function"`
 }
 
 type OllamaMessage struct {
@@ -140,16 +136,56 @@ type OllamaShowResponse struct {
 	Tensors      []any          `json:"tensors"`
 }
 
+type OpenAIToolFunction struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Parameters  map[string]any `json:"parameters,omitempty"`
+}
+
+type OpenAITool struct {
+	Type     string             `json:"type"`
+	Function OpenAIToolFunction `json:"function"`
+}
+
+type OpenAIToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments any    `json:"arguments"`
+}
+
+type OpenAIToolCall struct {
+	Index    *int                   `json:"index,omitempty"`
+	ID       string                 `json:"id,omitempty"`
+	Type     string                 `json:"type,omitempty"`
+	Function OpenAIToolCallFunction `json:"function"`
+}
+
 type OpenAIChatMessage struct {
-	Role    string `json:"role"`
-	Content any    `json:"content"`
+	Role       string           `json:"role"`
+	Name       string           `json:"name,omitempty"`
+	Content    any              `json:"content"`
+	ToolCalls  []OpenAIToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string           `json:"tool_call_id,omitempty"`
+	Images     []string         `json:"images,omitempty"`
+}
+
+type OpenAIStreamOptions struct {
+	IncludeUsage bool `json:"include_usage,omitempty"`
 }
 
 type OpenAIChatCompletionRequest struct {
-	Model    string              `json:"model"`
-	Messages []OpenAIChatMessage `json:"messages"`
-	Stream   bool                `json:"stream"`
-	Tools    []any               `json:"tools,omitempty"`
+	Model               string               `json:"model"`
+	Messages            []OpenAIChatMessage  `json:"messages"`
+	Stream              bool                 `json:"stream"`
+	StreamOptions       *OpenAIStreamOptions `json:"stream_options,omitempty"`
+	Tools               []OpenAITool         `json:"tools,omitempty"`
+	ToolChoice          any                  `json:"tool_choice,omitempty"`
+	Functions           []OpenAIToolFunction `json:"functions,omitempty"`
+	FunctionCall        any                  `json:"function_call,omitempty"`
+	Temperature         *float64             `json:"temperature,omitempty"`
+	TopP                *float64             `json:"top_p,omitempty"`
+	MaxTokens           *int                 `json:"max_tokens,omitempty"`
+	MaxCompletionTokens *int                 `json:"max_completion_tokens,omitempty"`
+	SessionID           string               `json:"session_id,omitempty"`
 }
 
 var (
@@ -195,9 +231,12 @@ func main() {
 		}
 	}
 
-	// If no specific gemini-live keys configured, share geminiKeys if available
+	// Share keys between Gemini and Gemini Live if either is missing
 	if len(geminiLiveKeys) == 0 && len(geminiKeys) > 0 {
 		geminiLiveKeys = append(geminiLiveKeys, geminiKeys...)
+	}
+	if len(geminiKeys) == 0 && len(geminiLiveKeys) > 0 {
+		geminiKeys = append(geminiKeys, geminiLiveKeys...)
 	}
 	// Fallback to GEMINI_API_KEY environment variable if keys are empty
 	if envKey := os.Getenv("GEMINI_API_KEY"); envKey != "" {
@@ -206,6 +245,12 @@ func main() {
 		}
 		if len(geminiLiveKeys) == 0 {
 			geminiLiveKeys = append(geminiLiveKeys, envKey)
+		}
+	}
+	// Fallback to OPENAI_API_KEY environment variable if keys are empty
+	if envKey := os.Getenv("OPENAI_API_KEY"); envKey != "" {
+		if len(openaiKeys) == 0 {
+			openaiKeys = append(openaiKeys, envKey)
 		}
 	}
 
@@ -329,44 +374,10 @@ func main() {
 		w.Write([]byte(`{"models":[]}`))
 	})
 
-	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[API] Listing models (/v1/models)...")
-		type openAIModel struct {
-			ID      string `json:"id"`
-			Object  string `json:"object"`
-			Created int64  `json:"created"`
-			OwnedBy string `json:"owned_by"`
-		}
-		var modelsList []openAIModel
-		for pName, p := range providersMap {
-			models, err := p.ListModels(r.Context())
-			if err != nil {
-				log.Printf("[API] Error listing models for provider %s: %v", pName, err)
-				continue
-			}
-			log.Printf("[API] Provider %s returned %d models", pName, len(models))
-			for _, m := range models {
-				modelsList = append(modelsList, openAIModel{
-					ID:      fmt.Sprintf("%s/%s", pName, m.ID),
-					Object:  "model",
-					Created: 1700000000,
-					OwnedBy: pName,
-				})
-				modelsList = append(modelsList, openAIModel{
-					ID:      m.ID,
-					Object:  "model",
-					Created: 1700000000,
-					OwnedBy: pName,
-				})
-			}
-		}
-		log.Printf("[API] /v1/models returning %d model(s)", len(modelsList))
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		json.NewEncoder(w).Encode(map[string]any{
-			"object": "list",
-			"data":   modelsList,
-		})
-	})
+	mux.HandleFunc("/v1/models", handleOpenAIModels)
+	mux.HandleFunc("/models", handleOpenAIModels)
+	mux.HandleFunc("/v1/models/", handleOpenAIModels)
+	mux.HandleFunc("/models/", handleOpenAIModels)
 
 	mux.HandleFunc("/api/show", func(w http.ResponseWriter, r *http.Request) {
 		var req OllamaShowRequest
@@ -412,159 +423,8 @@ func main() {
 		w.Write(data)
 	})
 
-	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
-		var req OpenAIChatCompletionRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		for _, m := range req.Messages {
-			content := extractOpenAITextContent(m.Content)
-			log.Printf("Client -> Proxy: [%s] %s", m.Role, content)
-		}
-		provider, targetModel := getProvider(req.Model)
-		req.Model = targetModel
-		internalMessages := make([]providers.Message, len(req.Messages))
-		for i, m := range req.Messages {
-			internalMessages[i] = providers.Message{
-				Role: m.Role,
-				Content: []providers.ContentPart{
-					{Type: providers.ContentTypeText, Text: extractOpenAITextContent(m.Content)},
-				},
-			}
-		}
-
-		internalReq := &providers.CompletionRequest{
-			Model:    req.Model,
-			Messages: internalMessages,
-			Stream:   req.Stream,
-		}
-
-		if req.Stream {
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("Connection", "keep-alive")
-
-			flusher, ok := w.(http.Flusher)
-			_, err := provider.Chat(r.Context(), internalReq, func(chunk *providers.CompletionResponse) {
-				chunkResp := map[string]any{
-					"id":      fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
-					"object":  "chat.completion.chunk",
-					"created": time.Now().Unix(),
-					"model":   req.Model,
-					"choices": []any{
-						map[string]any{
-							"index": 0,
-							"delta": map[string]any{"content": chunk.Content},
-							"finish_reason": nil,
-						},
-					},
-				}
-				
-				if len(chunk.ToolCalls) > 0 {
-					var openaiTCs []map[string]any
-					for i, tc := range chunk.ToolCalls {
-						openaiTCs = append(openaiTCs, map[string]any{
-							"index": i,
-							"id": tc.ID,
-							"type": "function",
-							"function": map[string]any{
-								"name": tc.Function.Name,
-								"arguments": tc.Function.Arguments,
-							},
-						})
-					}
-					// Update delta to include tool_calls
-					choices := chunkResp["choices"].([]any)
-					choice := choices[0].(map[string]any)
-					delta := choice["delta"].(map[string]any)
-					delta["tool_calls"] = openaiTCs
-				}
-
-				data, _ := json.Marshal(chunkResp)
-				fmt.Fprintf(w, "data: %s\n\n", data)
-				log.Printf("Provider -> Proxy: %s", chunk.Content)
-				log.Printf("Proxy -> Client: %s", chunk.Content)
-				if ok {
-					flusher.Flush()
-				}
-			})
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-
-			endResp := map[string]any{
-				"id":      fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
-				"object":  "chat.completion.chunk",
-				"created": time.Now().Unix(),
-				"model":   req.Model,
-				"choices": []any{
-					map[string]any{
-						"index": 0,
-						"delta": map[string]any{},
-						"finish_reason": "stop",
-					},
-				},
-			}
-
-			endData, _ := json.Marshal(endResp)
-			fmt.Fprintf(w, "data: %s\n\n", endData)
-			fmt.Fprint(w, "data: [DONE]\n\n")
-			log.Printf("Provider -> Proxy: [DONE]")
-			log.Printf("Proxy -> Client: [DONE]")
-			if ok {
-				flusher.Flush()
-			}
-			return
-		}
-
-		resp, err := provider.Chat(r.Context(), internalReq, nil)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		finalResp := map[string]any{
-			"id":      fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
-			"object":  "chat.completion",
-			"created": time.Now().Unix(),
-			"model":   req.Model,
-			"choices": []any{
-				map[string]any{
-					"index": 0,
-					"message": map[string]any{
-						"role":    "assistant",
-						"content": resp.Content,
-					},
-					"finish_reason": "stop",
-				},
-			},
-		}
-
-		if len(resp.ToolCalls) > 0 {
-			var openaiTCs []map[string]any
-			for _, tc := range resp.ToolCalls {
-				openaiTCs = append(openaiTCs, map[string]any{
-					"id": tc.ID,
-					"type": "function",
-					"function": map[string]any{
-						"name": tc.Function.Name,
-						"arguments": tc.Function.Arguments,
-					},
-				})
-			}
-			choices := finalResp["choices"].([]any)
-			choice := choices[0].(map[string]any)
-			msg := choice["message"].(map[string]any)
-			msg["tool_calls"] = openaiTCs
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(finalResp)
-		log.Printf("Provider -> Proxy: %s", resp.Content)
-		log.Printf("Proxy -> Client: [FULL RESPONSE]")
-	})
+	mux.HandleFunc("/v1/chat/completions", handleOpenAIChatCompletions)
+	mux.HandleFunc("/chat/completions", handleOpenAIChatCompletions)
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "Ollama is running")
@@ -655,7 +515,28 @@ func getProvider(model string) (providers.Provider, string) {
 		return geminiLiveProvider, fullModel
 	}
 
-	// 3. Single active provider: route everything to it
+	// 3. OpenAI model pattern match
+	if strings.HasPrefix(modelLower, "gpt-") || strings.HasPrefix(modelLower, "o1") || strings.HasPrefix(modelLower, "o3") || strings.HasPrefix(modelLower, "chatgpt") {
+		if openaiProvider != nil {
+			log.Printf("[ROUTE] OpenAI model pattern match -> Provider: openai, Model: %s", fullModel)
+			return openaiProvider, fullModel
+		}
+		// If openaiProvider not configured, alias to geminiProvider so it doesn't fail
+		if geminiProvider != nil {
+			log.Printf("[ROUTE] OpenAI model %q requested but no OpenAI key; routing to Gemini -> Model: gemini-2.0-flash", fullModel)
+			return geminiProvider, "gemini-2.0-flash"
+		}
+	}
+
+	// 4. Gemini model pattern match
+	if strings.HasPrefix(modelLower, "gemini") || strings.HasPrefix(modelLower, "learnlm") {
+		if geminiProvider != nil {
+			log.Printf("[ROUTE] Gemini model pattern match -> Provider: gemini, Model: %s", fullModel)
+			return geminiProvider, fullModel
+		}
+	}
+
+	// 5. Single active provider: route everything to it
 	if len(providersMap) == 1 {
 		for pName, p := range providersMap {
 			log.Printf("[ROUTE] Single active provider %q -> Model: %s", pName, fullModel)
@@ -663,15 +544,19 @@ func getProvider(model string) (providers.Provider, string) {
 		}
 	}
 
-	// 4. Provider name prefix match
+	// 6. Provider name prefix match
 	for pName, p := range providersMap {
-		if strings.HasPrefix(strings.ToLower(fullModel), pName) {
+		if strings.HasPrefix(modelLower, pName) {
 			log.Printf("[ROUTE] Provider prefix match -> Provider: %s, Model: %s", pName, fullModel)
 			return p, fullModel
 		}
 	}
 
-	// 5. Default fallback to registered provider
+	// 7. Default fallback to registered provider
+	if geminiProvider != nil {
+		log.Printf("[ROUTE] Fallback -> Provider: gemini, Model: %s", fullModel)
+		return geminiProvider, fullModel
+	}
 	for pName, p := range providersMap {
 		log.Printf("[ROUTE] Fallback -> Provider: %s, Model: %s", pName, fullModel)
 		return p, fullModel
@@ -757,11 +642,15 @@ func handleChat(w http.ResponseWriter, r *http.Request, req *OllamaChatRequest) 
 			},
 		}
 		for _, img := range m.Images {
-			parts = append(parts, providers.ContentPart{
-				Type:     providers.ContentTypeImage,
-				MimeType: "image/jpeg",
-				Data:     []byte(img),
-			})
+			if cp, err := parseImageURLToContentPart(img); err == nil {
+				parts = append(parts, cp)
+			} else {
+				parts = append(parts, providers.ContentPart{
+					Type:     providers.ContentTypeImage,
+					MimeType: "image/jpeg",
+					Data:     []byte(img),
+				})
+			}
 		}
 		internalMessages[i] = providers.Message{
 			Role:    m.Role,
@@ -1016,13 +905,14 @@ func extractOpenAITextContent(content any) string {
 	case []any:
 		var b strings.Builder
 		for _, item := range v {
-			part, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			if part["type"] == "text" {
-				if text, ok := part["text"].(string); ok {
-					b.WriteString(text)
+			switch p := item.(type) {
+			case string:
+				b.WriteString(p)
+			case map[string]any:
+				if p["type"] == "text" {
+					if text, ok := p["text"].(string); ok {
+						b.WriteString(text)
+					}
 				}
 			}
 		}
@@ -1030,4 +920,690 @@ func extractOpenAITextContent(content any) string {
 	default:
 		return ""
 	}
+}
+
+func handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
+	var req OpenAIChatCompletionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadRequest)
+		return
+	}
+	if req.Model == "" {
+		req.Model = "gemini-2.0-flash"
+	}
+
+	req.Model = normalizeModelName(req.Model)
+	provider, targetModel := getProvider(req.Model)
+	req.Model = targetModel
+
+	// Convert Tools
+	var internalTools []providers.Tool
+	for _, tool := range req.Tools {
+		name := tool.Function.Name
+		desc := tool.Function.Description
+		params := tool.Function.Parameters
+		if params == nil {
+			params = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
+		tType := tool.Type
+		if tType == "" {
+			tType = "function"
+		}
+		internalTools = append(internalTools, providers.Tool{
+			Type:        tType,
+			Name:        name,
+			Description: desc,
+			Parameters:  params,
+			Functions: []providers.Tool{
+				{
+					Type:        "function",
+					Name:        name,
+					Description: desc,
+					Parameters:  params,
+				},
+			},
+		})
+	}
+	if len(internalTools) == 0 && len(req.Functions) > 0 {
+		for _, f := range req.Functions {
+			params := f.Parameters
+			if params == nil {
+				params = map[string]any{"type": "object", "properties": map[string]any{}}
+			}
+			internalTools = append(internalTools, providers.Tool{
+				Type:        "function",
+				Name:        f.Name,
+				Description: f.Description,
+				Parameters:  params,
+				Functions: []providers.Tool{
+					{
+						Type:        "function",
+						Name:        f.Name,
+						Description: f.Description,
+						Parameters:  params,
+					},
+				},
+			})
+		}
+	}
+
+	// Convert Messages
+	internalMessages := make([]providers.Message, len(req.Messages))
+	for i, m := range req.Messages {
+		parts := parseOpenAIMessageParts(m.Content, m.Images)
+
+		var tcs []providers.ToolCall
+		for _, tc := range m.ToolCalls {
+			argsStr := ""
+			switch a := tc.Function.Arguments.(type) {
+			case string:
+				argsStr = a
+			case map[string]any:
+				b, _ := json.Marshal(a)
+				argsStr = string(b)
+			default:
+				if a != nil {
+					b, _ := json.Marshal(a)
+					argsStr = string(b)
+				} else {
+					argsStr = "{}"
+				}
+			}
+			tcID := tc.ID
+			if tcID == "" {
+				tcID = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), len(tcs))
+			}
+			tcType := tc.Type
+			if tcType == "" {
+				tcType = "function"
+			}
+			tcs = append(tcs, providers.ToolCall{
+				ID:   tcID,
+				Type: tcType,
+				Function: providers.FunctionCall{
+					Name:      tc.Function.Name,
+					Arguments: argsStr,
+				},
+			})
+		}
+
+		internalMessages[i] = providers.Message{
+			Role:       m.Role,
+			Name:       m.Name,
+			ToolCallID: m.ToolCallID,
+			Content:    parts,
+			ToolCalls:  tcs,
+		}
+
+		textContent := extractOpenAITextContent(m.Content)
+		log.Printf("Client -> Proxy (OpenAI): [%s] %s (parts: %d, tool_calls: %d)", m.Role, textContent, len(parts), len(tcs))
+	}
+
+	internalReq := &providers.CompletionRequest{
+		Model:    req.Model,
+		Messages: internalMessages,
+		Tools:    internalTools,
+		Stream:   req.Stream,
+	}
+
+	// Session management
+	var session *Session
+	if req.SessionID != "" {
+		session = sessionManager.GetSession(req.SessionID)
+		if len(internalReq.Messages) > 0 {
+			lastClientMsg := internalReq.Messages[len(internalReq.Messages)-1]
+			if len(session.Messages) == 0 {
+				session.Messages = internalReq.Messages
+			} else {
+				found := false
+				for _, sm := range session.Messages {
+					if sm.Role == lastClientMsg.Role && len(sm.Content) > 0 && len(lastClientMsg.Content) > 0 && sm.Content[0].Text == lastClientMsg.Content[0].Text {
+						found = true
+						break
+					}
+				}
+				if !found {
+					session.Messages = append(session.Messages, lastClientMsg)
+				}
+			}
+			internalReq.Messages = session.Messages
+		}
+	}
+
+	completionID := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+	createdTime := time.Now().Unix()
+
+	if req.Stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("Transfer-Encoding", "chunked")
+		w.Header().Set("X-Accel-Buffering", "no")
+
+		flusher, ok := w.(http.Flusher)
+		hasToolCalls := false
+
+		// Emit initial role chunk immediately so clients like VS Code Copilot receive choices right away
+		initChunk := map[string]any{
+			"id":                 completionID,
+			"object":             "chat.completion.chunk",
+			"created":            createdTime,
+			"model":              req.Model,
+			"system_fingerprint": "fp_ollama_one",
+			"choices": []any{
+				map[string]any{
+					"index":         0,
+					"delta":         map[string]any{"role": "assistant"},
+					"finish_reason": nil,
+				},
+			},
+		}
+		initData, _ := json.Marshal(initChunk)
+		fmt.Fprintf(w, "data: %s\n\n", initData)
+		if ok {
+			flusher.Flush()
+		}
+
+		var fullContent strings.Builder
+		var allStreamToolCalls []providers.ToolCall
+
+		_, err := provider.Chat(r.Context(), internalReq, func(chunk *providers.CompletionResponse) {
+			delta := map[string]any{}
+
+			if chunk.Content != "" {
+				delta["content"] = chunk.Content
+				fullContent.WriteString(chunk.Content)
+			}
+
+			if len(chunk.ToolCalls) > 0 {
+				hasToolCalls = true
+				allStreamToolCalls = append(allStreamToolCalls, chunk.ToolCalls...)
+				var openaiTCs []map[string]any
+				for i, tc := range chunk.ToolCalls {
+					tcID := tc.ID
+					if tcID == "" {
+						tcID = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), i)
+					}
+					tcArgs := tc.Function.Arguments
+					if tcArgs == "" {
+						tcArgs = "{}"
+					}
+					openaiTCs = append(openaiTCs, map[string]any{
+						"index": i,
+						"id":    tcID,
+						"type":  "function",
+						"function": map[string]any{
+							"name":      tc.Function.Name,
+							"arguments": tcArgs,
+						},
+					})
+				}
+				delta["tool_calls"] = openaiTCs
+			}
+
+			if len(delta) == 0 {
+				return
+			}
+
+			chunkResp := map[string]any{
+				"id":                 completionID,
+				"object":             "chat.completion.chunk",
+				"created":            createdTime,
+				"model":              req.Model,
+				"system_fingerprint": "fp_ollama_one",
+				"choices": []any{
+					map[string]any{
+						"index":         0,
+						"delta":         delta,
+						"finish_reason": nil,
+					},
+				},
+			}
+
+			data, _ := json.Marshal(chunkResp)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			if ok {
+				flusher.Flush()
+			}
+		})
+
+		if err != nil {
+			log.Printf("[OpenAI] Streaming chat error: %v", err)
+			errChunk := map[string]any{
+				"id":                 completionID,
+				"object":             "chat.completion.chunk",
+				"created":            createdTime,
+				"model":              req.Model,
+				"system_fingerprint": "fp_ollama_one",
+				"choices": []any{
+					map[string]any{
+						"index":         0,
+						"delta":         map[string]any{"content": fmt.Sprintf("\n[Error: %v]", err)},
+						"finish_reason": "stop",
+					},
+				},
+			}
+			errData, _ := json.Marshal(errChunk)
+			fmt.Fprintf(w, "data: %s\n\n", errData)
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			if ok {
+				flusher.Flush()
+			}
+			return
+		}
+
+		if session != nil {
+			session.Messages = append(session.Messages, providers.Message{
+				Role:      "assistant",
+				Content:   []providers.ContentPart{{Type: providers.ContentTypeText, Text: fullContent.String()}},
+				ToolCalls: allStreamToolCalls,
+			})
+		}
+
+		finishReason := "stop"
+		if hasToolCalls {
+			finishReason = "tool_calls"
+		}
+
+		endResp := map[string]any{
+			"id":                 completionID,
+			"object":             "chat.completion.chunk",
+			"created":            createdTime,
+			"model":              req.Model,
+			"system_fingerprint": "fp_ollama_one",
+			"choices": []any{
+				map[string]any{
+					"index":         0,
+					"delta":         map[string]any{},
+					"finish_reason": finishReason,
+				},
+			},
+		}
+
+		endData, _ := json.Marshal(endResp)
+		fmt.Fprintf(w, "data: %s\n\n", endData)
+
+		if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
+			promptTokens := estimateTokens(internalMessages)
+			completionTokens := estimateStringTokens(fullContent.String())
+			usageResp := map[string]any{
+				"id":                 completionID,
+				"object":             "chat.completion.chunk",
+				"created":            createdTime,
+				"model":              req.Model,
+				"system_fingerprint": "fp_ollama_one",
+				"choices": []any{
+					map[string]any{
+						"index":         0,
+						"delta":         map[string]any{},
+						"finish_reason": nil,
+					},
+				},
+				"usage": map[string]any{
+					"prompt_tokens":     promptTokens,
+					"completion_tokens": completionTokens,
+					"total_tokens":      promptTokens + completionTokens,
+				},
+			}
+			usageData, _ := json.Marshal(usageResp)
+			fmt.Fprintf(w, "data: %s\n\n", usageData)
+		}
+
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		if ok {
+			flusher.Flush()
+		}
+		return
+	}
+
+	resp, err := provider.Chat(r.Context(), internalReq, nil)
+	if err != nil {
+		log.Printf("[OpenAI] Chat completion error: %v", err)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(w).Encode(map[string]any{
+			"id":                 completionID,
+			"object":             "chat.completion",
+			"created":            createdTime,
+			"model":              req.Model,
+			"system_fingerprint": "fp_ollama_one",
+			"choices": []any{
+				map[string]any{
+					"index": 0,
+					"message": map[string]any{
+						"role":    "assistant",
+						"content": fmt.Sprintf("[Error: %v]", err),
+					},
+					"finish_reason": "stop",
+				},
+			},
+			"usage": map[string]any{
+				"prompt_tokens":     estimateTokens(internalMessages),
+				"completion_tokens": 5,
+				"total_tokens":      estimateTokens(internalMessages) + 5,
+			},
+		})
+		return
+	}
+
+	if session != nil {
+		session.Messages = append(session.Messages, providers.Message{
+			Role:      "assistant",
+			Content:   []providers.ContentPart{{Type: providers.ContentTypeText, Text: resp.Content}},
+			ToolCalls: resp.ToolCalls,
+		})
+	}
+
+	hasToolCalls := len(resp.ToolCalls) > 0
+	finishReason := "stop"
+	if hasToolCalls {
+		finishReason = "tool_calls"
+	}
+
+	msgObj := map[string]any{
+		"role": "assistant",
+	}
+	if hasToolCalls && resp.Content == "" {
+		msgObj["content"] = nil
+	} else {
+		msgObj["content"] = resp.Content
+	}
+
+	if hasToolCalls {
+		var openaiTCs []map[string]any
+		for i, tc := range resp.ToolCalls {
+			tcID := tc.ID
+			if tcID == "" {
+				tcID = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), i)
+			}
+			tcArgs := tc.Function.Arguments
+			if tcArgs == "" {
+				tcArgs = "{}"
+			}
+			openaiTCs = append(openaiTCs, map[string]any{
+				"id":   tcID,
+				"type": "function",
+				"function": map[string]any{
+					"name":      tc.Function.Name,
+					"arguments": tcArgs,
+				},
+			})
+		}
+		msgObj["tool_calls"] = openaiTCs
+	}
+
+	promptTokens := estimateTokens(internalMessages)
+	completionTokens := estimateStringTokens(resp.Content)
+
+	finalResp := map[string]any{
+		"id":                 completionID,
+		"object":             "chat.completion",
+		"created":            createdTime,
+		"model":              req.Model,
+		"system_fingerprint": "fp_ollama_one",
+		"choices": []any{
+			map[string]any{
+				"index":         0,
+				"message":       msgObj,
+				"finish_reason": finishReason,
+			},
+		},
+		"usage": map[string]any{
+			"prompt_tokens":     promptTokens,
+			"completion_tokens": completionTokens,
+			"total_tokens":      promptTokens + completionTokens,
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(finalResp)
+}
+
+func handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[API] Handling models request: %s %s", r.Method, r.URL.Path)
+	type openAIModel struct {
+		ID      string `json:"id"`
+		Object  string `json:"object"`
+		Created int64  `json:"created"`
+		OwnedBy string `json:"owned_by"`
+	}
+
+	path := strings.TrimPrefix(r.URL.Path, "/v1/models")
+	path = strings.TrimPrefix(path, "/models")
+	path = strings.TrimPrefix(path, "/")
+
+	if path != "" {
+		modelID := path
+		providerName := "ollama-one"
+		if idx := strings.Index(modelID, "/"); idx != -1 {
+			providerName = modelID[:idx]
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(w).Encode(openAIModel{
+			ID:      modelID,
+			Object:  "model",
+			Created: 1700000000,
+			OwnedBy: providerName,
+		})
+		return
+	}
+
+	var modelsList []openAIModel
+	for pName, p := range providersMap {
+		models, err := p.ListModels(r.Context())
+		if err != nil {
+			log.Printf("[API] Error listing models for provider %s: %v", pName, err)
+			continue
+		}
+		for _, m := range models {
+			modelsList = append(modelsList, openAIModel{
+				ID:      fmt.Sprintf("%s/%s", pName, m.ID),
+				Object:  "model",
+				Created: 1700000000,
+				OwnedBy: pName,
+			})
+			modelsList = append(modelsList, openAIModel{
+				ID:      m.ID,
+				Object:  "model",
+				Created: 1700000000,
+				OwnedBy: pName,
+			})
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(map[string]any{
+		"object": "list",
+		"data":   modelsList,
+	})
+}
+
+func parseOpenAIMessageParts(content any, images []string) []providers.ContentPart {
+	var parts []providers.ContentPart
+
+	if content != nil {
+		switch c := content.(type) {
+		case string:
+			if c != "" {
+				parts = append(parts, providers.ContentPart{
+					Type: providers.ContentTypeText,
+					Text: c,
+				})
+			}
+		case []any:
+			for _, item := range c {
+				switch p := item.(type) {
+				case string:
+					if p != "" {
+						parts = append(parts, providers.ContentPart{
+							Type: providers.ContentTypeText,
+							Text: p,
+						})
+					}
+				case map[string]any:
+					partType, _ := p["type"].(string)
+					switch partType {
+					case "text":
+						if text, ok := p["text"].(string); ok && text != "" {
+							parts = append(parts, providers.ContentPart{
+								Type: providers.ContentTypeText,
+								Text: text,
+							})
+						}
+					case "image_url":
+						var urlStr string
+						if urlObj, ok := p["image_url"].(map[string]any); ok {
+							if u, ok := urlObj["url"].(string); ok {
+								urlStr = u
+							}
+						} else if u, ok := p["image_url"].(string); ok {
+							urlStr = u
+						}
+						if urlStr != "" {
+							if cp, err := parseImageURLToContentPart(urlStr); err == nil {
+								parts = append(parts, cp)
+							} else {
+								log.Printf("[Vision] Error parsing image_url: %v", err)
+							}
+						}
+					case "image":
+						var imgStr string
+						if s, ok := p["image"].(string); ok {
+							imgStr = s
+						} else if u, ok := p["url"].(string); ok {
+							imgStr = u
+						}
+						if imgStr != "" {
+							if cp, err := parseImageURLToContentPart(imgStr); err == nil {
+								parts = append(parts, cp)
+							}
+						}
+					default:
+						if text, ok := p["text"].(string); ok && text != "" {
+							parts = append(parts, providers.ContentPart{
+								Type: providers.ContentTypeText,
+								Text: text,
+							})
+						}
+					}
+				}
+			}
+		}
+	}
+
+	for _, img := range images {
+		if cp, err := parseImageURLToContentPart(img); err == nil {
+			parts = append(parts, cp)
+		}
+	}
+
+	return parts
+}
+
+func parseImageURLToContentPart(imageRef string) (providers.ContentPart, error) {
+	imageRef = strings.TrimSpace(imageRef)
+
+	// 1. Data URI: data:image/png;base64,...
+	if strings.HasPrefix(imageRef, "data:") {
+		colonIdx := strings.Index(imageRef, ":")
+		commaIdx := strings.Index(imageRef, ",")
+		if commaIdx > colonIdx {
+			meta := imageRef[colonIdx+1 : commaIdx]
+			rawB64 := imageRef[commaIdx+1:]
+			mimeType := "image/jpeg"
+			if semiIdx := strings.Index(meta, ";"); semiIdx != -1 {
+				mimeType = meta[:semiIdx]
+			} else if meta != "" {
+				mimeType = meta
+			}
+
+			decoded, err := base64.StdEncoding.DecodeString(rawB64)
+			if err != nil {
+				decoded, err = base64.URLEncoding.DecodeString(rawB64)
+			}
+			if err != nil {
+				return providers.ContentPart{}, fmt.Errorf("failed to decode data uri base64: %w", err)
+			}
+			return providers.ContentPart{
+				Type:     providers.ContentTypeImage,
+				MimeType: mimeType,
+				Data:     decoded,
+			}, nil
+		}
+	}
+
+	// 2. HTTP / HTTPS URL
+	if strings.HasPrefix(imageRef, "http://") || strings.HasPrefix(imageRef, "https://") {
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Get(imageRef)
+		if err != nil {
+			return providers.ContentPart{}, fmt.Errorf("failed to fetch image from URL %s: %w", imageRef, err)
+		}
+		defer resp.Body.Close()
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return providers.ContentPart{}, fmt.Errorf("failed to read image body from URL %s: %w", imageRef, err)
+		}
+		mimeType := resp.Header.Get("Content-Type")
+		if mimeType == "" || !strings.HasPrefix(mimeType, "image/") {
+			mimeType = http.DetectContentType(data)
+		}
+		if !strings.HasPrefix(mimeType, "image/") {
+			mimeType = "image/jpeg"
+		}
+		return providers.ContentPart{
+			Type:     providers.ContentTypeImage,
+			MimeType: mimeType,
+			Data:     data,
+		}, nil
+	}
+
+	// 3. Raw Base64 string
+	cleanedB64 := strings.ReplaceAll(strings.ReplaceAll(imageRef, "\n", ""), "\r", "")
+	decoded, err := base64.StdEncoding.DecodeString(cleanedB64)
+	if err == nil && len(decoded) > 0 {
+		mimeType := http.DetectContentType(decoded)
+		if !strings.HasPrefix(mimeType, "image/") {
+			mimeType = "image/jpeg"
+		}
+		return providers.ContentPart{
+			Type:     providers.ContentTypeImage,
+			MimeType: mimeType,
+			Data:     decoded,
+		}, nil
+	}
+
+	return providers.ContentPart{}, fmt.Errorf("unknown image reference format")
+}
+
+func estimateStringTokens(s string) int {
+	if s == "" {
+		return 0
+	}
+	tokens := len(s) / 4
+	if tokens == 0 {
+		return 1
+	}
+	return tokens
+}
+
+func estimateTokens(messages []providers.Message) int {
+	count := 0
+	for _, m := range messages {
+		count += 4
+		for _, p := range m.Content {
+			if p.Text != "" {
+				count += estimateStringTokens(p.Text)
+			}
+			if len(p.Data) > 0 {
+				count += 258
+			}
+		}
+		for _, tc := range m.ToolCalls {
+			count += estimateStringTokens(tc.Function.Name) + estimateStringTokens(tc.Function.Arguments)
+		}
+	}
+	if count == 0 {
+		return 1
+	}
+	return count
 }
