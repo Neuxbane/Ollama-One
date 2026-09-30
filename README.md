@@ -89,12 +89,6 @@ Paste the custom endpoint configuration into the `chatLanguageModels.json` file:
       "url": "http://127.0.0.1:11434/v1/chat/completions",
       "toolCalling": true,
       "vision": true,
-      "supportsReasoningEffort": [
-        "low",
-        "medium",
-        "high"
-      ],
-      "reasoningEffortFormat": "chat-completions",
       "maxInputTokens": 128000,
       "maxOutputTokens": 16000
     },
