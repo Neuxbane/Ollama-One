@@ -257,3 +257,115 @@ func TestGeminiLiveProviderChatMockWS(t *testing.T) {
 		t.Errorf("expected thought chunk 'Thinking about greetings...', got %v", thoughts)
 	}
 }
+
+func TestGeminiLiveProviderToolCallInProgress(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Logf("upgrade error: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		// 1. Read setup frame
+		conn.ReadMessage()
+
+		// 2. Respond with setupComplete
+		conn.WriteJSON(map[string]any{
+			"setupComplete": map[string]any{},
+		})
+
+		// 3. Read clientContent
+		conn.ReadMessage()
+
+		// 4. Send initial phrase with turnComplete: true, interactionStatus: "IN_PROGRESS"
+		conn.WriteJSON(map[string]any{
+			"serverContent": map[string]any{
+				"modelTurn": map[string]any{
+					"parts": []map[string]any{
+						{
+							"text": "Let me check the codebase for you.",
+						},
+					},
+				},
+				"turnComplete":      true,
+				"interactionStatus": "IN_PROGRESS",
+			},
+		})
+
+		// Give client time to process without closing
+		time.Sleep(50 * time.Millisecond)
+
+		// 5. Send toolCall frame
+		conn.WriteJSON(map[string]any{
+			"toolCall": map[string]any{
+				"functionCalls": []map[string]any{
+					{
+						"id":   "call_check_code",
+						"name": "check_workspace",
+						"args": map[string]any{
+							"query": "codebase",
+						},
+					},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	provider := NewGeminiLiveProvider([]string{"dummy-key"})
+	provider.WSURL = wsURL
+	provider.OutputDir = t.TempDir()
+
+	req := &CompletionRequest{
+		Model: "gemini-3.8-live-extended-thinking",
+		Messages: []Message{
+			{
+				Role: "user",
+				Content: []ContentPart{
+					{Type: ContentTypeText, Text: "can you check this codebase"},
+				},
+			},
+		},
+		Tools: []Tool{
+			{
+				Type: "function",
+				Name: "check_workspace",
+			},
+		},
+		Stream: true,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var streamedToolCalls []ToolCall
+	resp, err := provider.Chat(ctx, req, func(c *CompletionResponse) {
+		if len(c.ToolCalls) > 0 {
+			streamedToolCalls = append(streamedToolCalls, c.ToolCalls...)
+		}
+	})
+
+	if err != nil {
+		t.Fatalf("Chat error: %v", err)
+	}
+
+	if resp.Content != "Let me check the codebase for you." {
+		t.Errorf("expected content 'Let me check the codebase for you.', got %q", resp.Content)
+	}
+
+	if len(resp.ToolCalls) != 1 {
+		t.Fatalf("expected 1 tool call in resp, got %d", len(resp.ToolCalls))
+	}
+	if resp.ToolCalls[0].Function.Name != "check_workspace" {
+		t.Errorf("expected tool name 'check_workspace', got %s", resp.ToolCalls[0].Function.Name)
+	}
+	if len(streamedToolCalls) != 1 {
+		t.Errorf("expected 1 streamed tool call, got %d", len(streamedToolCalls))
+	}
+}
+

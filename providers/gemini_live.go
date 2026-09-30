@@ -7,14 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
 	"net/url"
 	"os"
-	"path/filepath"
-	"regexp"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -22,6 +17,18 @@ import (
 
 // SupportedLiveModels lists the preconfigured Gemini Live models
 var SupportedLiveModels = []ModelInfo{
+	{
+		ID:           "gemini-3.8-live-extended-thinking",
+		Name:         "Gemini 3.8 Flash Live Extended Thinking",
+		ContextSize:  128000,
+		Capabilities: []string{"audio", "vision", "tools", "chat", "completion"},
+	},
+	{
+		ID:           "gemini-3.8-live",
+		Name:         "Gemini 3.8 Flash Live",
+		ContextSize:  128000,
+		Capabilities: []string{"audio", "vision", "tools", "chat", "completion"},
+	},
 	{
 		ID:           "gemini-3.1-flash-live-preview",
 		Name:         "Gemini 3.1 Flash Live Preview",
@@ -107,6 +114,25 @@ func FormatHistory(messages []Message) string {
 		role := "User"
 		if msg.Role == "model" || msg.Role == "assistant" {
 			role = "Assistant"
+		} else if msg.Role == "tool" || msg.Role == "function" {
+			role = "Tool Result"
+			name := msg.Name
+			if name == "" && msg.ToolCallID != "" {
+				for _, prev := range messages {
+					for _, tc := range prev.ToolCalls {
+						if tc.ID == msg.ToolCallID {
+							name = tc.Function.Name
+							break
+						}
+					}
+					if name != "" {
+						break
+					}
+				}
+			}
+			if name != "" {
+				role = fmt.Sprintf("Tool Result (%s)", name)
+			}
 		}
 		var msgText strings.Builder
 		for _, part := range msg.Content {
@@ -133,10 +159,11 @@ type liveSetupMessage struct {
 }
 
 type liveSetup struct {
-	Model             string                `json:"model"`
-	GenerationConfig  *liveGenerationConfig `json:"generationConfig,omitempty"`
-	SystemInstruction *geminiContent        `json:"systemInstruction,omitempty"`
-	Tools             []liveTool            `json:"tools,omitempty"`
+	Model                    string                `json:"model"`
+	GenerationConfig         *liveGenerationConfig `json:"generationConfig,omitempty"`
+	SystemInstruction        *geminiContent        `json:"systemInstruction,omitempty"`
+	OutputAudioTranscription map[string]any        `json:"outputAudioTranscription,omitempty"`
+	Tools                    []liveTool            `json:"tools,omitempty"`
 }
 
 type liveGenerationConfig struct {
@@ -145,8 +172,9 @@ type liveGenerationConfig struct {
 }
 
 type liveThinking struct {
-	IncludeThoughts bool `json:"includeThoughts"`
-	ThinkingBudget  int  `json:"thinkingBudget"`
+	IncludeThoughts bool   `json:"includeThoughts"`
+	ThinkingLevel   string `json:"thinkingLevel,omitempty"`
+	ThinkingBudget  *int   `json:"thinkingBudget,omitempty"`
 }
 
 type liveTool struct {
@@ -191,16 +219,18 @@ type liveIncomingFrame struct {
 	ServerContent *struct {
 		ModelTurn *struct {
 			Parts []struct {
-				Text       string        `json:"text,omitempty"`
-				Thought    bool          `json:"thought,omitempty"`
-				InlineData *geminiInline `json:"inlineData,omitempty"`
+				Text         string              `json:"text,omitempty"`
+				Thought      bool                `json:"thought,omitempty"`
+				InlineData   *geminiInline       `json:"inlineData,omitempty"`
+				FunctionCall *geminiFunctionCall `json:"functionCall,omitempty"`
 			} `json:"parts,omitempty"`
 		} `json:"modelTurn,omitempty"`
 		OutputTranscription *struct {
 			Text string `json:"text,omitempty"`
 		} `json:"outputTranscription,omitempty"`
-		TurnComplete bool `json:"turnComplete,omitempty"`
-		Interrupted  bool `json:"interrupted,omitempty"`
+		TurnComplete      bool   `json:"turnComplete,omitempty"`
+		Interrupted       bool   `json:"interrupted,omitempty"`
+		InteractionStatus string `json:"interactionStatus,omitempty"`
 	} `json:"serverContent,omitempty"`
 	ToolCall *struct {
 		FunctionCalls []struct {
@@ -228,6 +258,38 @@ func (p *GeminiLiveProvider) Chat(ctx context.Context, req *CompletionRequest, o
 	if model == "" {
 		model = "gemini-3.1-flash-live-preview"
 	}
+
+	// Model normalization & thinking level detection
+	modelLower := strings.ToLower(model)
+	var thinkingLevel string
+	if strings.Contains(modelLower, "extended-thinking") || strings.Contains(modelLower, "high") {
+		thinkingLevel = "HIGH"
+	} else if strings.Contains(modelLower, "low") {
+		thinkingLevel = "LOW"
+	} else if strings.Contains(modelLower, "minimal") {
+		thinkingLevel = "MINIMAL"
+	} else if strings.Contains(modelLower, "medium") {
+		thinkingLevel = "MEDIUM"
+	} else if strings.Contains(modelLower, "3.8") {
+		thinkingLevel = "LOW"
+	} else {
+		thinkingLevel = "HIGH"
+	}
+
+	if req.Thinking != nil && req.Thinking.ThinkingLevel != "" {
+		thinkingLevel = strings.ToUpper(string(req.Thinking.ThinkingLevel))
+	}
+
+	// Map gemini-3.8-live alias to models/gemini-3.8-live-extended-thinking
+	if model == "gemini-3.8-live" || model == "models/gemini-3.8-live" {
+		model = "models/gemini-3.8-live-extended-thinking"
+	}
+	// Google's 3.8 live backend currently fails with a system error during function calling.
+	// Automatically route to 3.1-flash-live-preview when tools are present for reliable execution.
+	if len(req.Tools) > 0 && strings.Contains(strings.ToLower(model), "3.8") {
+		log.Printf("[Gemini Live] Model %s encounters server-side error during live tool calling on Google backend. Routing to models/gemini-3.1-flash-live-preview", model)
+		model = "models/gemini-3.1-flash-live-preview"
+	}
 	if !strings.HasPrefix(model, "models/") {
 		model = "models/" + model
 	}
@@ -252,12 +314,31 @@ func (p *GeminiLiveProvider) Chat(ctx context.Context, req *CompletionRequest, o
 
 	log.Printf("[Gemini Live] Connection opened successfully.")
 
-	// Prepare history and turns
+	// Separate system instructions and conversation messages
+	var systemInstructions []string
+	if req.SystemInstruction != "" {
+		systemInstructions = append(systemInstructions, req.SystemInstruction)
+	}
+
+	var conversationMessages []Message
+	for _, msg := range req.Messages {
+		if msg.Role == "system" || msg.Role == "developer" {
+			for _, part := range msg.Content {
+				if part.Text != "" {
+					systemInstructions = append(systemInstructions, part.Text)
+				}
+			}
+		} else {
+			conversationMessages = append(conversationMessages, msg)
+		}
+	}
+
+	// Prepare history and current prompt from conversation messages only
 	var historyMessages []Message
 	var currentMessage *Message
-	if len(req.Messages) > 0 {
-		historyMessages = req.Messages[:len(req.Messages)-1]
-		currentMessage = &req.Messages[len(req.Messages)-1]
+	if len(conversationMessages) > 0 {
+		historyMessages = conversationMessages[:len(conversationMessages)-1]
+		currentMessage = &conversationMessages[len(conversationMessages)-1]
 	}
 
 	historyString := FormatHistory(historyMessages)
@@ -268,6 +349,27 @@ func (p *GeminiLiveProvider) Chat(ctx context.Context, req *CompletionRequest, o
 		var textParts []string
 		if historyString != "" {
 			textParts = append(textParts, historyString+"\n\n=== CURRENT PROMPT ===\n")
+		}
+
+		if currentMessage.Role == "tool" || currentMessage.Role == "function" {
+			name := currentMessage.Name
+			if name == "" && currentMessage.ToolCallID != "" {
+				for _, hmsg := range historyMessages {
+					for _, tc := range hmsg.ToolCalls {
+						if tc.ID == currentMessage.ToolCallID {
+							name = tc.Function.Name
+							break
+						}
+					}
+					if name != "" {
+						break
+					}
+				}
+			}
+			if name == "" {
+				name = "tool"
+			}
+			textParts = append(textParts, fmt.Sprintf("[Tool Result for %s]:\n", name))
 		}
 
 		for _, part := range currentMessage.Content {
@@ -322,15 +424,16 @@ func (p *GeminiLiveProvider) Chat(ctx context.Context, req *CompletionRequest, o
 				ResponseModalities: modalities,
 				ThinkingConfig: &liveThinking{
 					IncludeThoughts: true,
-					ThinkingBudget:  -1,
+					ThinkingLevel:   thinkingLevel,
 				},
 			},
+			OutputAudioTranscription: map[string]any{},
 		},
 	}
 
-	if req.SystemInstruction != "" {
+	if len(systemInstructions) > 0 {
 		setupMsg.Setup.SystemInstruction = &geminiContent{
-			Parts: []geminiPart{{Text: req.SystemInstruction}},
+			Parts: []geminiPart{{Text: strings.Join(systemInstructions, "\n\n")}},
 		}
 	}
 
@@ -367,7 +470,8 @@ func (p *GeminiLiveProvider) Chat(ctx context.Context, req *CompletionRequest, o
 		return nil, fmt.Errorf("failed to send setup frame: %w", err)
 	}
 
-	// Audio accumulation and media saving
+	// WAV audio accumulation and media generation commented out as requested
+	/*
 	var (
 		audioChunks   [][]byte
 		audioMimeType string
@@ -454,6 +558,7 @@ func (p *GeminiLiveProvider) Chat(ctx context.Context, req *CompletionRequest, o
 		}
 		log.Printf("[Gemini Live] Saved generated media: %s", filePath)
 	}
+	*/
 
 	var (
 		fullResponse CompletionResponse
@@ -519,12 +624,32 @@ func (p *GeminiLiveProvider) Chat(ctx context.Context, req *CompletionRequest, o
 							if onChunk != nil {
 								onChunk(&CompletionResponse{Thought: part.Text})
 							}
+						} else if part.FunctionCall != nil {
+							callID := part.FunctionCall.ID
+							if callID == "" {
+								callID = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), len(fullResponse.ToolCalls))
+							}
+							argsBytes, _ := json.Marshal(part.FunctionCall.Args)
+							tc := ToolCall{
+								ID:   callID,
+								Type: "function",
+								Function: FunctionCall{
+									Name:      part.FunctionCall.Name,
+									Arguments: string(argsBytes),
+								},
+							}
+							fullResponse.ToolCalls = append(fullResponse.ToolCalls, tc)
+							if onChunk != nil {
+								onChunk(&CompletionResponse{ToolCalls: []ToolCall{tc}})
+							}
 						} else if part.Text != "" {
 							fullResponse.Content += part.Text
 							if onChunk != nil {
 								onChunk(&CompletionResponse{Content: part.Text})
 							}
 						} else if part.InlineData != nil {
+							// Inline media / audio WAV generation commented out as requested
+							/*
 							if strings.HasPrefix(part.InlineData.MimeType, "audio/pcm") {
 								audioMutex.Lock()
 								audioChunks = append(audioChunks, part.InlineData.Data)
@@ -533,6 +658,7 @@ func (p *GeminiLiveProvider) Chat(ctx context.Context, req *CompletionRequest, o
 							} else {
 								go saveGeneratedMediaImmediately(part.InlineData)
 							}
+							*/
 						}
 					}
 				}
@@ -547,8 +673,14 @@ func (p *GeminiLiveProvider) Chat(ctx context.Context, req *CompletionRequest, o
 				}
 
 				if frame.ServerContent.TurnComplete {
-					log.Printf("[Gemini Live] Server turnComplete flag received.")
-					saveAccumulatedAudio()
+					log.Printf("[Gemini Live] Server turnComplete flag received. interactionStatus=%s, toolCalls=%d",
+						frame.ServerContent.InteractionStatus, len(fullResponse.ToolCalls))
+					if len(fullResponse.ToolCalls) > 0 {
+						return
+					}
+					if frame.ServerContent.InteractionStatus == "IN_PROGRESS" {
+						continue
+					}
 					return
 				}
 			}
@@ -556,11 +688,10 @@ func (p *GeminiLiveProvider) Chat(ctx context.Context, req *CompletionRequest, o
 			// Handle tool call events
 			if frame.ToolCall != nil && len(frame.ToolCall.FunctionCalls) > 0 {
 				log.Printf("[Gemini Live] Server function call request detected: %d calls", len(frame.ToolCall.FunctionCalls))
-				var toolResponses []liveFunctionResponse
 				for _, fc := range frame.ToolCall.FunctionCalls {
 					callID := fc.ID
 					if callID == "" {
-						callID = fmt.Sprintf("call_%d", time.Now().UnixNano())
+						callID = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), len(fullResponse.ToolCalls))
 					}
 					argsBytes, _ := json.Marshal(fc.Args)
 					tc := ToolCall{
@@ -575,41 +706,22 @@ func (p *GeminiLiveProvider) Chat(ctx context.Context, req *CompletionRequest, o
 					if onChunk != nil {
 						onChunk(&CompletionResponse{ToolCalls: []ToolCall{tc}})
 					}
-
-					toolResponses = append(toolResponses, liveFunctionResponse{
-						ID:   callID,
-						Name: fc.Name,
-						Response: map[string]any{
-							"result": "Acknowledged tool call " + fc.Name,
-						},
-					})
 				}
-
-				// Send tool response frame back to WebSocket
-				toolRespMsg := liveToolResponseMessage{
-					ToolResponse: liveToolResponse{
-						FunctionResponses: toolResponses,
-					},
-				}
-				toolRespJSON, _ := json.Marshal(toolRespMsg)
-				log.Printf("[Gemini Live] Outgoing toolResponse frame: %s", string(toolRespJSON))
-				if err := conn.WriteMessage(websocket.TextMessage, toolRespJSON); err != nil {
-					errChan <- fmt.Errorf("failed to send toolResponse: %w", err)
-					return
-				}
+				// Return immediately so the tool call is handed back to the caller (Copilot)
+				return
 			}
 		}
 	}()
 
 	select {
 	case err := <-errChan:
-		saveAccumulatedAudio()
+		// saveAccumulatedAudio()
 		return nil, err
 	case <-doneChan:
-		saveAccumulatedAudio()
+		// saveAccumulatedAudio()
 		return &fullResponse, nil
 	case <-ctx.Done():
-		saveAccumulatedAudio()
+		// saveAccumulatedAudio()
 		return nil, ctx.Err()
 	}
 }

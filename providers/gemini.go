@@ -887,17 +887,20 @@ func sanitizeGeminiSchema(val any) any {
 	case map[string]any:
 		cleaned := make(map[string]any)
 		for k, child := range v {
-			// Remove schema properties that Google Gemini REST API rejects
+			// Remove schema properties that Google Gemini REST / Live API rejects or fails on
 			switch k {
-			case "$comment", "$schema", "$id", "title", "enumDescriptions", "examples", "default", "additionalProperties":
+			case "$comment", "$schema", "$id", "title", "enumDescriptions", "examples", "default", "additionalProperties",
+				"pattern", "format", "minLength", "maxLength", "minimum", "maximum", "minItems", "maxItems", "uniqueItems":
 				continue
 			}
 			cleaned[k] = sanitizeGeminiSchema(child)
 		}
 
-		// Handle type arrays e.g. ["string", "null"] -> type: "string", nullable: true
+		// Handle type: normalize to uppercase OpenAPI/Protobuf type
 		if typeVal, exists := cleaned["type"]; exists {
-			if typeSlice, ok := typeVal.([]any); ok {
+			if typeStr, ok := typeVal.(string); ok {
+				cleaned["type"] = strings.ToUpper(typeStr)
+			} else if typeSlice, ok := typeVal.([]any); ok {
 				firstType := ""
 				isNullable := false
 				for _, t := range typeSlice {
@@ -910,13 +913,27 @@ func sanitizeGeminiSchema(val any) any {
 					}
 				}
 				if firstType != "" {
-					cleaned["type"] = firstType
+					cleaned["type"] = strings.ToUpper(firstType)
 				} else {
-					cleaned["type"] = "string"
+					cleaned["type"] = "STRING"
 				}
 				if isNullable {
 					cleaned["nullable"] = true
 				}
+			}
+		}
+
+		// Ensure OBJECT has properties map
+		if t, ok := cleaned["type"].(string); ok && t == "OBJECT" {
+			if cleaned["properties"] == nil {
+				cleaned["properties"] = map[string]any{}
+			}
+		}
+
+		// Ensure ARRAY has items schema
+		if t, ok := cleaned["type"].(string); ok && t == "ARRAY" {
+			if cleaned["items"] == nil {
+				cleaned["items"] = map[string]any{"type": "STRING"}
 			}
 		}
 
