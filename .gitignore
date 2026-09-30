@@ -1,2 +1,5 @@
 config.json
 log/
+generated/
+ollama-one
+Ollama-One

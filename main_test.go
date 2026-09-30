@@ -474,13 +474,22 @@ func TestLiveModelRouting(t *testing.T) {
 		t.Errorf("Expected target model 'gemini-3.1-flash-live-preview', got '%s'", targetModel)
 	}
 
-	// Test namespaced "live/gemini-3.1-flash-live-preview"
-	p2, targetModel2 := getProvider("live/gemini-3.1-flash-live-preview")
-	if p2 == nil {
-		t.Fatalf("Expected provider for live/gemini-3.1-flash-live-preview, got nil")
+	// Test pattern match on "gemini-3.8-live-extended-thinking"
+	p3, targetModel3 := getProvider("gemini-3.8-live-extended-thinking")
+	if p3 == nil {
+		t.Fatalf("Expected provider for gemini-3.8-live-extended-thinking, got nil")
 	}
-	if targetModel2 != "gemini-3.1-flash-live-preview" {
-		t.Errorf("Expected target model 'gemini-3.1-flash-live-preview', got '%s'", targetModel2)
+	if targetModel3 != "gemini-3.8-live-extended-thinking" {
+		t.Errorf("Expected target model 'gemini-3.8-live-extended-thinking', got '%s'", targetModel3)
+	}
+
+	// Test pattern match on "gemini-3.8-live"
+	p4, targetModel4 := getProvider("gemini-3.8-live")
+	if p4 == nil {
+		t.Fatalf("Expected provider for gemini-3.8-live, got nil")
+	}
+	if targetModel4 != "gemini-3.8-live" {
+		t.Errorf("Expected target model 'gemini-3.8-live', got '%s'", targetModel4)
 	}
 }
 

@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -185,6 +184,7 @@ type OpenAIChatCompletionRequest struct {
 	TopP                *float64             `json:"top_p,omitempty"`
 	MaxTokens           *int                 `json:"max_tokens,omitempty"`
 	MaxCompletionTokens *int                 `json:"max_completion_tokens,omitempty"`
+	ReasoningEffort     string               `json:"reasoning_effort,omitempty"`
 	SessionID           string               `json:"session_id,omitempty"`
 }
 
@@ -274,9 +274,12 @@ func main() {
 	}
 
 
+	// Log directory creation commented out as requested
+	/*
 	if _, err := os.Stat("log"); os.IsNotExist(err) {
 		os.Mkdir("log", 0755)
 	}
+	*/
 
 	mux := http.NewServeMux()
 
@@ -867,6 +870,8 @@ func handleChat(w http.ResponseWriter, r *http.Request, req *OllamaChatRequest) 
 }
 
 func logInteraction(model string, messages []OllamaMessage, tools []OllamaTool, providerResponse *providers.CompletionResponse, clientResponse any) {
+	// Interaction logging to file commented out as requested
+	/*
 	timestamp := time.Now().Format("20060102_150405")
 	filename := filepath.Join("log", fmt.Sprintf("chat_%s_%s.log", timestamp, strings.ReplaceAll(model, ":", "_")))
 
@@ -896,6 +901,7 @@ func logInteraction(model string, messages []OllamaMessage, tools []OllamaTool, 
 	if err := os.WriteFile(filename, data, 0644); err != nil {
 		log.Printf("Error writing log file: %v", err)
 	}
+	*/
 }
 
 func extractOpenAITextContent(content any) string {
@@ -1044,6 +1050,13 @@ func handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Messages: internalMessages,
 		Tools:    internalTools,
 		Stream:   req.Stream,
+	}
+
+	if req.ReasoningEffort != "" {
+		internalReq.Thinking = &providers.ThinkingConfig{
+			IncludeThoughts: true,
+			ThinkingLevel:   providers.ThinkingLevel(strings.ToLower(req.ReasoningEffort)),
+		}
 	}
 
 	// Session management

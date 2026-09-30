@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  ollama-one:
+    build: .
+    container_name: ollama-one
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./config.json:/app/config.json
+    restart: unless-stopped
