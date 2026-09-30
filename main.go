@@ -222,8 +222,10 @@ func main() {
 		switch t {
 		case "gemini":
 			geminiKeys = append(geminiKeys, entry.Key)
+			geminiLiveKeys = append(geminiLiveKeys, entry.Key)
 		case "gemini-live", "live", "geminilive":
 			geminiLiveKeys = append(geminiLiveKeys, entry.Key)
+			geminiKeys = append(geminiKeys, entry.Key)
 		case "openai":
 			openaiKeys = append(openaiKeys, entry.Key)
 		default:
