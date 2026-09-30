@@ -6,6 +6,8 @@ services:
     container_name: ollama-one
     ports:
       - "11434:11434"
+    environment:
+      - HOST=0.0.0.0
     volumes:
       - ./config.json:/app/config.json
     restart: unless-stopped
