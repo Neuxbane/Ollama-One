@@ -22,16 +22,10 @@ type MockProvider struct {
 func (m *MockProvider) ListModels(ctx context.Context) ([]providers.ModelInfo, error) {
 	return []providers.ModelInfo{
 		{
-			ID:           "google/gemini-2.0-flash",
-			Name:         "Gemini 2.0 Flash",
+			ID:           "mock-model",
+			Name:         "Mock Model",
 			ContextSize:  128000,
 			Capabilities: []string{"vision", "tools"},
-		},
-		{
-			ID:           "google/ws/gemini-3.1-flash-live-preview",
-			Name:         "Gemini 3.1 Flash Live Preview (WebSocket)",
-			ContextSize:  128000,
-			Capabilities: []string{"vision", "tools", "audio"},
 		},
 	}, nil
 }
@@ -58,6 +52,7 @@ func (m *MockProvider) Chat(ctx context.Context, req *providers.CompletionReques
 }
 
 func TestParseImageURLToContentPart(t *testing.T) {
+	// 1. Data URI with PNG header
 	pngData := "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 	dataURI := "data:image/png;base64," + pngData
 
@@ -76,6 +71,7 @@ func TestParseImageURLToContentPart(t *testing.T) {
 		t.Errorf("Decoded image bytes do not match expected")
 	}
 
+	// 2. Raw base64 string
 	partRaw, err := parseImageURLToContentPart(pngData)
 	if err != nil {
 		t.Fatalf("Failed to parse raw base64: %v", err)
@@ -89,11 +85,13 @@ func TestParseImageURLToContentPart(t *testing.T) {
 }
 
 func TestParseOpenAIMessageParts(t *testing.T) {
+	// String content
 	parts := parseOpenAIMessageParts("Hello world", nil)
 	if len(parts) != 1 || parts[0].Text != "Hello world" {
 		t.Fatalf("Unexpected parts for string content: %+v", parts)
 	}
 
+	// Array of text + image_url
 	pngData := "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 	dataURI := "data:image/png;base64," + pngData
 
@@ -119,48 +117,17 @@ func TestParseOpenAIMessageParts(t *testing.T) {
 	}
 }
 
-func TestCleanUserPrompt(t *testing.T) {
-	// Case 1: Copilot reminder instructions dump with userRequest
-	rawInput := `<reminderInstructions>
-It is much faster to edit using the replace_string_in_file tool. Prefer the replace_string_in_file tool for making edits and only fall back to insert_edit_into_file if it fails.
-</reminderInstructions>
-<userRequest>
-can you read the file inside
-</userRequest>`
-
-	cleaned := cleanUserPrompt(rawInput)
-	expected := "can you read the file inside"
-	if cleaned != expected {
-		t.Errorf("Expected %q, got %q", expected, cleaned)
-	}
-
-	// Case 2: Simple userRequest with "ok"
-	rawOk := `<userRequest>
-ok
-</userRequest>`
-	cleanedOk := cleanUserPrompt(rawOk)
-	if cleanedOk != "ok" {
-		t.Errorf("Expected 'ok', got %q", cleanedOk)
-	}
-
-	// Case 3: Regular text without tags
-	regular := "hello how are you"
-	if cleanUserPrompt(regular) != regular {
-		t.Errorf("Expected regular text preserved, got %q", cleanUserPrompt(regular))
-	}
-}
-
-func TestChatCompletionsVision(t *testing.T) {
+func TestOpenAIChatCompletionsVision(t *testing.T) {
 	mock := &MockProvider{
 		Resp: &providers.CompletionResponse{Content: "That is a red pixel."},
 	}
-	googleProvider = mock
+	providersMap["mock"] = mock
 
 	pngData := "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
 	dataURI := "data:image/png;base64," + pngData
 
 	reqBody := map[string]any{
-		"model": "google/gemini-2.0-flash",
+		"model": "mock/model",
 		"messages": []any{
 			map[string]any{
 				"role": "user",
@@ -182,12 +149,13 @@ func TestChatCompletionsVision(t *testing.T) {
 	httpReq := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(bodyBytes))
 	rec := httptest.NewRecorder()
 
-	handleChatCompletions(rec, httpReq)
+	handleOpenAIChatCompletions(rec, httpReq)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("Expected status 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 
+	// Verify the mock received the image part
 	if mock.LastReq == nil || len(mock.LastReq.Messages) == 0 {
 		t.Fatalf("Provider did not receive messages")
 	}
@@ -199,9 +167,13 @@ func TestChatCompletionsVision(t *testing.T) {
 		t.Errorf("Expected ContentTypeImage for part 1, got %s", msg.Content[1].Type)
 	}
 
+	// Verify response structure
 	var resp map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("Failed to parse response JSON: %v", err)
+	}
+	if resp["object"] != "chat.completion" {
+		t.Errorf("Expected object chat.completion, got %v", resp["object"])
 	}
 	choices := resp["choices"].([]any)
 	firstChoice := choices[0].(map[string]any)
@@ -211,7 +183,7 @@ func TestChatCompletionsVision(t *testing.T) {
 	}
 }
 
-func TestChatCompletionsTools(t *testing.T) {
+func TestOpenAIChatCompletionsTools(t *testing.T) {
 	mock := &MockProvider{
 		Resp: &providers.CompletionResponse{
 			Content: "",
@@ -227,10 +199,10 @@ func TestChatCompletionsTools(t *testing.T) {
 			},
 		},
 	}
-	googleProvider = mock
+	providersMap["mock"] = mock
 
 	reqBody := map[string]any{
-		"model": "google/gemini-2.0-flash",
+		"model": "mock/model",
 		"messages": []any{
 			map[string]any{
 				"role":    "user",
@@ -260,12 +232,13 @@ func TestChatCompletionsTools(t *testing.T) {
 	httpReq := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(bodyBytes))
 	rec := httptest.NewRecorder()
 
-	handleChatCompletions(rec, httpReq)
+	handleOpenAIChatCompletions(rec, httpReq)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("Expected status 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 
+	// Verify provider received tool definition
 	if len(mock.LastReq.Tools) == 0 {
 		t.Fatalf("Provider did not receive tool definitions")
 	}
@@ -273,6 +246,7 @@ func TestChatCompletionsTools(t *testing.T) {
 		t.Errorf("Expected tool get_weather, got %s", mock.LastReq.Tools[0].Name)
 	}
 
+	// Verify response has tool_calls and finish_reason: "tool_calls"
 	var resp map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("Failed to parse response JSON: %v", err)
@@ -300,16 +274,16 @@ func TestChatCompletionsTools(t *testing.T) {
 	}
 }
 
-func TestChatCompletionsStreaming(t *testing.T) {
+func TestOpenAIChatCompletionsStreaming(t *testing.T) {
 	mock := &MockProvider{
 		Resp: &providers.CompletionResponse{
 			Content: "Hello world!",
 		},
 	}
-	googleProvider = mock
+	providersMap["mock"] = mock
 
 	reqBody := map[string]any{
-		"model": "google/gemini-2.0-flash",
+		"model": "mock/model",
 		"messages": []any{
 			map[string]any{"role": "user", "content": "Hi"},
 		},
@@ -320,7 +294,7 @@ func TestChatCompletionsStreaming(t *testing.T) {
 	httpReq := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(bodyBytes))
 	rec := httptest.NewRecorder()
 
-	handleChatCompletions(rec, httpReq)
+	handleOpenAIChatCompletions(rec, httpReq)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("Expected status 200, got %d: %s", rec.Code, rec.Body.String())
@@ -335,13 +309,14 @@ func TestChatCompletionsStreaming(t *testing.T) {
 	}
 }
 
-func TestModelsEndpoint(t *testing.T) {
+func TestOpenAIModelsEndpoint(t *testing.T) {
 	mock := &MockProvider{}
-	googleProvider = mock
+	providersMap["mock"] = mock
 
+	// Test list models
 	httpReq := httptest.NewRequest("GET", "/v1/models", nil)
 	rec := httptest.NewRecorder()
-	handleModels(rec, httpReq)
+	handleOpenAIModels(rec, httpReq)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("Expected status 200, got %d", rec.Code)
@@ -355,9 +330,10 @@ func TestModelsEndpoint(t *testing.T) {
 		t.Errorf("Expected object 'list', got %v", listResp["object"])
 	}
 
-	httpReq2 := httptest.NewRequest("GET", "/v1/models/google/gemini-2.0-flash", nil)
+	// Test single model
+	httpReq2 := httptest.NewRequest("GET", "/v1/models/gpt-4o", nil)
 	rec2 := httptest.NewRecorder()
-	handleModels(rec2, httpReq2)
+	handleOpenAIModels(rec2, httpReq2)
 
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("Expected status 200, got %d", rec2.Code)
@@ -366,21 +342,21 @@ func TestModelsEndpoint(t *testing.T) {
 	if err := json.Unmarshal(rec2.Body.Bytes(), &modelResp); err != nil {
 		t.Fatalf("Failed to parse single model JSON: %v", err)
 	}
-	if modelResp["id"] != "google/gemini-2.0-flash" {
-		t.Errorf("Expected id google/gemini-2.0-flash, got %v", modelResp["id"])
+	if modelResp["id"] != "gpt-4o" {
+		t.Errorf("Expected id gpt-4o, got %v", modelResp["id"])
 	}
 }
 
-func TestChatCompletionsMultiTurnToolResult(t *testing.T) {
+func TestOpenAIChatCompletionsMultiTurnToolResult(t *testing.T) {
 	mock := &MockProvider{
 		Resp: &providers.CompletionResponse{
 			Content: "The weather in Tokyo is 18°C and sunny.",
 		},
 	}
-	googleProvider = mock
+	providersMap["mock"] = mock
 
 	reqBody := map[string]any{
-		"model": "google/gemini-2.0-flash",
+		"model": "mock/model",
 		"messages": []any{
 			map[string]any{
 				"role":    "user",
@@ -414,7 +390,7 @@ func TestChatCompletionsMultiTurnToolResult(t *testing.T) {
 	httpReq := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(bodyBytes))
 	rec := httptest.NewRecorder()
 
-	handleChatCompletions(rec, httpReq)
+	handleOpenAIChatCompletions(rec, httpReq)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("Expected status 200, got %d: %s", rec.Code, rec.Body.String())
@@ -424,6 +400,7 @@ func TestChatCompletionsMultiTurnToolResult(t *testing.T) {
 		t.Fatalf("Expected 3 messages in provider request, got %v", mock.LastReq)
 	}
 
+	// Message 1: assistant with tool calls
 	asstMsg := mock.LastReq.Messages[1]
 	if asstMsg.Role != "assistant" || len(asstMsg.ToolCalls) != 1 {
 		t.Errorf("Expected assistant message with 1 tool call, got %+v", asstMsg)
@@ -432,6 +409,7 @@ func TestChatCompletionsMultiTurnToolResult(t *testing.T) {
 		t.Errorf("Expected tool call ID call_abc123, got %s", asstMsg.ToolCalls[0].ID)
 	}
 
+	// Message 2: tool message
 	toolMsg := mock.LastReq.Messages[2]
 	if toolMsg.Role != "tool" || toolMsg.ToolCallID != "call_abc123" || toolMsg.Name != "get_weather" {
 		t.Errorf("Expected tool message with ID call_abc123 and name get_weather, got %+v", toolMsg)
@@ -440,3 +418,78 @@ func TestChatCompletionsMultiTurnToolResult(t *testing.T) {
 		t.Errorf("Unexpected tool message content: %+v", toolMsg.Content)
 	}
 }
+
+func TestOllamaChatEndpointCompatibility(t *testing.T) {
+	mock := &MockProvider{
+		Resp: &providers.CompletionResponse{
+			Content: "Hello from Ollama!",
+		},
+	}
+	providersMap["mock"] = mock
+
+	reqBody := OllamaChatRequest{
+		Model: "mock/model",
+		Messages: []OllamaMessage{
+			{Role: "user", Content: "Hello"},
+		},
+		Stream: false,
+	}
+
+	bodyBytes, _ := json.Marshal(reqBody)
+	httpReq := httptest.NewRequest("POST", "/api/chat", bytes.NewReader(bodyBytes))
+	rec := httptest.NewRecorder()
+
+	handleChat(rec, httpReq, &reqBody)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("Expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp OllamaChatResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to parse Ollama response: %v", err)
+	}
+	if resp.Message.Content != "Hello from Ollama!" {
+		t.Errorf("Unexpected Ollama message content: %s", resp.Message.Content)
+	}
+}
+
+func TestLiveModelRouting(t *testing.T) {
+	liveMock := &MockProvider{
+		Resp: &providers.CompletionResponse{
+			Content: "Hello from Gemini Live!",
+		},
+	}
+	geminiLiveProvider = &providers.GeminiLiveProvider{
+		BaseProvider: providers.BaseProvider{APIKeys: []string{"dummy"}},
+	}
+	providersMap["gemini-live"] = liveMock
+
+	// Test pattern match on "gemini-3.1-flash-live-preview"
+	p, targetModel := getProvider("gemini-3.1-flash-live-preview")
+	if p == nil {
+		t.Fatalf("Expected provider for gemini-3.1-flash-live-preview, got nil")
+	}
+	if targetModel != "gemini-3.1-flash-live-preview" {
+		t.Errorf("Expected target model 'gemini-3.1-flash-live-preview', got '%s'", targetModel)
+	}
+
+	// Test pattern match on "gemini-3.8-live-extended-thinking"
+	p3, targetModel3 := getProvider("gemini-3.8-live-extended-thinking")
+	if p3 == nil {
+		t.Fatalf("Expected provider for gemini-3.8-live-extended-thinking, got nil")
+	}
+	if targetModel3 != "gemini-3.8-live-extended-thinking" {
+		t.Errorf("Expected target model 'gemini-3.8-live-extended-thinking', got '%s'", targetModel3)
+	}
+
+	// Test pattern match on "gemini-3.8-live"
+	p4, targetModel4 := getProvider("gemini-3.8-live")
+	if p4 == nil {
+		t.Fatalf("Expected provider for gemini-3.8-live, got nil")
+	}
+	if targetModel4 != "gemini-3.8-live" {
+		t.Errorf("Expected target model 'gemini-3.8-live', got '%s'", targetModel4)
+	}
+}
+

@@ -1,6 +1,10 @@
 [
   {
-    "type": "google",
-    "key": "AIzaSy_YOUR_GOOGLE_GEMINI_API_KEY_HERE"
+    "type": "gemini",
+    "key": "AIzaSy_YOUR_GEMINI_API_KEY_HERE"
+  },
+  {
+    "type": "openai",
+    "key": "sk-YOUR_OPENAI_API_KEY_HERE"
   }
 ]
