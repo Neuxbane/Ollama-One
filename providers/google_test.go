@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestGoogleProviderListModelsLive(t *testing.T) {
@@ -138,7 +139,7 @@ func TestBuildGeminiContents(t *testing.T) {
 		},
 	}
 
-	// Live mode: tool role becomes user with functionResponse part
+	// Live mode: turns are formatted as text to conform to Google Live WebSocket schema and avoid 1007
 	liveContents, sys := p.buildGeminiContents(messages, true)
 	if len(sys) != 0 {
 		t.Errorf("Expected 0 system instructions, got %d", len(sys))
@@ -149,17 +150,20 @@ func TestBuildGeminiContents(t *testing.T) {
 	if liveContents[0].Role != "user" || liveContents[0].Parts[0].Text != "can you scan this codebase" {
 		t.Errorf("Turn 0 mismatch: %+v", liveContents[0])
 	}
-	if liveContents[1].Role != "model" || liveContents[1].Parts[0].FunctionCall == nil || liveContents[1].Parts[0].FunctionCall.Name != "read_file" {
+	if liveContents[1].Role != "model" || !strings.Contains(liveContents[1].Parts[0].Text, "[Called Tool: read_file") {
 		t.Errorf("Turn 1 mismatch: %+v", liveContents[1])
 	}
-	if liveContents[2].Role != "user" || liveContents[2].Parts[0].FunctionResponse == nil || liveContents[2].Parts[0].FunctionResponse.Name != "read_file" {
+	if liveContents[2].Role != "user" || !strings.Contains(liveContents[2].Parts[0].Text, "[Tool Result for read_file]:\npackage main") {
 		t.Errorf("Turn 2 mismatch: %+v", liveContents[2])
 	}
 
-	// REST mode: tool role becomes function
+	// REST mode: tool role becomes function with structured functionResponse part
 	restContents, _ := p.buildGeminiContents(messages, false)
 	if len(restContents) != 3 {
 		t.Fatalf("Expected 3 turns, got %d", len(restContents))
+	}
+	if restContents[1].Role != "model" || restContents[1].Parts[0].FunctionCall == nil || restContents[1].Parts[0].FunctionCall.Name != "read_file" {
+		t.Errorf("Turn 1 REST mismatch: %+v", restContents[1])
 	}
 	if restContents[2].Role != "function" || restContents[2].Parts[0].FunctionResponse == nil {
 		t.Errorf("Turn 2 REST mismatch: %+v", restContents[2])
@@ -201,4 +205,47 @@ func TestTruncateMiddle(t *testing.T) {
 		t.Errorf("Expected middle truncation marker, got %q", truncated)
 	}
 }
+
+func TestLiveConnSessionMatching(t *testing.T) {
+	liveConnsLock.Lock()
+	liveConns = make(map[string]*liveConnSession)
+	liveConnsLock.Unlock()
+
+	// 1. Expired session is cleaned up
+	expiredSess := &liveConnSession{
+		expiresAt: time.Now().Add(-1 * time.Minute),
+	}
+	liveConnsLock.Lock()
+	liveConns["call_expired"] = expiredSess
+	liveConnsLock.Unlock()
+
+	cleanExpiredLiveConns()
+
+	liveConnsLock.Lock()
+	if _, exists := liveConns["call_expired"]; exists {
+		t.Errorf("Expected call_expired to be cleaned up")
+	}
+	liveConnsLock.Unlock()
+
+	// 2. Active session is retained
+	activeSess := &liveConnSession{
+		expiresAt: time.Now().Add(2 * time.Minute),
+	}
+	liveConnsLock.Lock()
+	liveConns["call_active_1"] = activeSess
+	liveConns["call_active_2"] = activeSess
+	liveConnsLock.Unlock()
+
+	cleanExpiredLiveConns()
+
+	liveConnsLock.Lock()
+	if _, exists := liveConns["call_active_1"]; !exists {
+		t.Errorf("Expected call_active_1 to remain active")
+	}
+	if _, exists := liveConns["call_active_2"]; !exists {
+		t.Errorf("Expected call_active_2 to remain active")
+	}
+	liveConnsLock.Unlock()
+}
+
 

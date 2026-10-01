@@ -13,6 +13,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -339,13 +340,19 @@ func (p *GoogleProvider) buildGeminiContents(messages []Message, isLive bool) ([
 			} else {
 				args = make(map[string]any)
 			}
-			parts = append(parts, geminiPart{
-				FunctionCall: &geminiFunctionCall{
-					Name: tc.Function.Name,
-					Args: args,
-					ID:   tc.ID,
-				},
-			})
+			if isLive {
+				parts = append(parts, geminiPart{
+					Text: fmt.Sprintf("[Called Tool: %s with arguments: %s]", tc.Function.Name, tc.Function.Arguments),
+				})
+			} else {
+				parts = append(parts, geminiPart{
+					FunctionCall: &geminiFunctionCall{
+						Name: tc.Function.Name,
+						Args: args,
+						ID:   tc.ID,
+					},
+				})
+			}
 		}
 
 		funcName := msg.Name
@@ -385,28 +392,29 @@ func (p *GoogleProvider) buildGeminiContents(messages []Message, isLive bool) ([
 			case ContentTypeText:
 				if msg.Role == "tool" || msg.Role == "function" {
 					toolText := truncateMiddle(part.Text, maxToolResultChars)
-					respMap := map[string]any{"result": toolText}
-					var jsonResult any
-					if err := json.Unmarshal([]byte(part.Text), &jsonResult); err == nil {
-						if m, ok := jsonResult.(map[string]any); ok {
-							respMap = truncateMapStrings(m, maxToolResultChars)
-						} else {
-							respMap = map[string]any{"result": jsonResult}
-						}
-					}
-					gp.FunctionResponse = &geminiFunctionResponse{
-						Name:     funcName,
-						Response: respMap,
-						ID:       msg.ToolCallID,
-					}
-					respJSON, _ := json.Marshal(respMap)
-					respPreview := string(respJSON)
-					if len(respPreview) > 300 {
-						respPreview = respPreview[:300] + fmt.Sprintf("... [truncated %d chars]", len(respPreview)-300)
-					}
 					if isLive {
-						log.Printf("[DEBUG][WS -> GEMINI] Function Response | Tool: %s, ID: %s, Response: %s", funcName, msg.ToolCallID, respPreview)
+						gp.Text = fmt.Sprintf("[Tool Result for %s]:\n%s", funcName, toolText)
+						log.Printf("[DEBUG][WS -> GEMINI] History Tool Result as text | Tool: %s, ID: %s", funcName, msg.ToolCallID)
 					} else {
+						respMap := map[string]any{"result": toolText}
+						var jsonResult any
+						if err := json.Unmarshal([]byte(part.Text), &jsonResult); err == nil {
+							if m, ok := jsonResult.(map[string]any); ok {
+								respMap = truncateMapStrings(m, maxToolResultChars)
+							} else {
+								respMap = map[string]any{"result": jsonResult}
+							}
+						}
+						gp.FunctionResponse = &geminiFunctionResponse{
+							Name:     funcName,
+							Response: respMap,
+							ID:       msg.ToolCallID,
+						}
+						respJSON, _ := json.Marshal(respMap)
+						respPreview := string(respJSON)
+						if len(respPreview) > 300 {
+							respPreview = respPreview[:300] + fmt.Sprintf("... [truncated %d chars]", len(respPreview)-300)
+						}
 						log.Printf("[DEBUG][REST -> GEMINI] Function Response | Tool: %s, ID: %s, Response: %s", funcName, msg.ToolCallID, respPreview)
 					}
 				} else {
@@ -1023,9 +1031,10 @@ type liveIncomingFrame struct {
 		OutputTranscription *struct {
 			Text string `json:"text,omitempty"`
 		} `json:"outputTranscription,omitempty"`
-		TurnComplete      bool   `json:"turnComplete,omitempty"`
-		Interrupted       bool   `json:"interrupted,omitempty"`
-		InteractionStatus string `json:"interactionStatus,omitempty"`
+		TurnComplete       bool   `json:"turnComplete,omitempty"`
+		GenerationComplete bool   `json:"generationComplete,omitempty"`
+		Interrupted        bool   `json:"interrupted,omitempty"`
+		InteractionStatus  string `json:"interactionStatus,omitempty"`
 	} `json:"serverContent,omitempty"`
 	ToolCall *struct {
 		FunctionCalls []struct {
@@ -1036,112 +1045,263 @@ type liveIncomingFrame struct {
 	} `json:"toolCall,omitempty"`
 }
 
+type liveConnSession struct {
+	conn      *websocket.Conn
+	expiresAt time.Time
+}
+
+var (
+	liveConnsLock sync.Mutex
+	liveConns     = make(map[string]*liveConnSession)
+)
+
+func cleanExpiredLiveConns() {
+	liveConnsLock.Lock()
+	defer liveConnsLock.Unlock()
+	now := time.Now()
+	for id, sess := range liveConns {
+		if now.After(sess.expiresAt) {
+			if sess.conn != nil {
+				sess.conn.Close()
+			}
+			delete(liveConns, id)
+		}
+	}
+}
+
 func (p *GoogleProvider) chatWebSocket(ctx context.Context, apiKey string, targetModel string, req *CompletionRequest, onChunk func(*CompletionResponse)) (*CompletionResponse, error) {
-	model := targetModel
-	if model == "" {
-		model = "gemini-3.1-flash-live-preview"
-	}
+	cleanExpiredLiveConns()
 
-	modelLower := strings.ToLower(model)
-	var thinkingLevel string
-	if strings.Contains(modelLower, "extended-thinking") || strings.Contains(modelLower, "high") {
-		thinkingLevel = "HIGH"
-	} else if strings.Contains(modelLower, "low") {
-		thinkingLevel = "LOW"
-	} else if strings.Contains(modelLower, "minimal") {
-		thinkingLevel = "MINIMAL"
-	} else if strings.Contains(modelLower, "medium") {
-		thinkingLevel = "MEDIUM"
-	} else if strings.Contains(modelLower, "3.8") {
-		thinkingLevel = "LOW"
-	} else {
-		thinkingLevel = "HIGH"
-	}
-
-	if req.Thinking != nil && req.Thinking.ThinkingLevel != "" {
-		thinkingLevel = strings.ToUpper(string(req.Thinking.ThinkingLevel))
-	}
-
-	if !strings.HasPrefix(model, "models/") {
-		model = "models/" + model
-	}
-
-	wsURL := p.WSURL
-	if wsURL == "" {
-		wsURL = fmt.Sprintf("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=%s", url.QueryEscape(apiKey))
-	}
-
-	dialer := websocket.DefaultDialer
-	conn, resp, err := dialer.DialContext(ctx, wsURL, nil)
-	if err != nil {
-		if resp != nil {
-			return nil, fmt.Errorf("google live ws dial failed with status %d: %w", resp.StatusCode, err)
+	var matchedSession *liveConnSession
+	for _, msg := range req.Messages {
+		if (msg.Role == "tool" || msg.Role == "function") && msg.ToolCallID != "" {
+			liveConnsLock.Lock()
+			if sess, ok := liveConns[msg.ToolCallID]; ok {
+				if time.Now().Before(sess.expiresAt) {
+					matchedSession = sess
+				}
+			}
+			liveConnsLock.Unlock()
+			if matchedSession != nil {
+				break
+			}
 		}
-		return nil, fmt.Errorf("google live ws dial failed: %w", err)
-	}
-	defer conn.Close()
-
-	contents, systemInstructions := p.buildGeminiContents(req.Messages, true)
-	if req.SystemInstruction != "" {
-		systemInstructions = append([]string{req.SystemInstruction}, systemInstructions...)
 	}
 
-	modalities := p.ResponseModalities
-	if len(modalities) == 0 {
-		modalities = []string{"AUDIO"}
-	}
+	var (
+		conn         *websocket.Conn
+		isReused     bool
+		keepConnOpen bool
+	)
 
-	setupMsg := liveSetupMessage{
-		Setup: liveSetup{
-			Model: model,
-			GenerationConfig: &liveGenerationConfig{
-				ResponseModalities: modalities,
-				ThinkingConfig: &liveThinking{
-					IncludeThoughts: true,
-					ThinkingLevel:   thinkingLevel,
+	if matchedSession != nil {
+		liveConnsLock.Lock()
+		for id, sess := range liveConns {
+			if sess == matchedSession {
+				delete(liveConns, id)
+			}
+		}
+		liveConnsLock.Unlock()
+
+		var toolResponses []geminiFunctionResponse
+		for i := len(req.Messages) - 1; i >= 0; i-- {
+			msg := req.Messages[i]
+			if msg.Role != "tool" && msg.Role != "function" {
+				break
+			}
+			funcName := msg.Name
+			if funcName == "" && msg.ToolCallID != "" {
+				for j := i - 1; j >= 0; j-- {
+					for _, tc := range req.Messages[j].ToolCalls {
+						if tc.ID == msg.ToolCallID {
+							funcName = tc.Function.Name
+							break
+						}
+					}
+					if funcName != "" {
+						break
+					}
+				}
+			}
+			if funcName == "" {
+				for j := i - 1; j >= 0; j-- {
+					if len(req.Messages[j].ToolCalls) > 0 {
+						funcName = req.Messages[j].ToolCalls[0].Function.Name
+						break
+					}
+				}
+			}
+			for _, pfx := range []string{"tool_use:", "tool_code:", "tool_call:", "call:"} {
+				funcName = strings.TrimPrefix(funcName, pfx)
+			}
+			if funcName == "" {
+				funcName = "unknown"
+			}
+
+			toolText := ""
+			for _, part := range msg.Content {
+				if part.Type == ContentTypeText && part.Text != "" {
+					toolText += part.Text
+				}
+			}
+			toolText = truncateMiddle(toolText, maxToolResultChars)
+
+			respMap := map[string]any{"result": toolText}
+			var jsonResult any
+			if err := json.Unmarshal([]byte(toolText), &jsonResult); err == nil {
+				if m, ok := jsonResult.(map[string]any); ok {
+					respMap = truncateMapStrings(m, maxToolResultChars)
+				} else {
+					respMap = map[string]any{"result": jsonResult}
+				}
+			}
+
+			toolResponses = append([]geminiFunctionResponse{
+				{
+					Name:     funcName,
+					Response: respMap,
+					ID:       msg.ToolCallID,
 				},
+			}, toolResponses...)
+		}
+
+		if len(toolResponses) > 0 {
+			toolRespMsg := map[string]any{
+				"toolResponse": map[string]any{
+					"functionResponses": toolResponses,
+				},
+			}
+			toolRespJSON, err := json.Marshal(toolRespMsg)
+			if err == nil {
+				log.Printf("[DEBUG][WS -> GEMINI] Reusing connection for %d tool response(s)...", len(toolResponses))
+				if err := matchedSession.conn.WriteMessage(websocket.TextMessage, toolRespJSON); err == nil {
+					conn = matchedSession.conn
+					isReused = true
+				} else {
+					log.Printf("[WARN][WS] Failed to write toolResponse to cached connection (%v), falling back to new connection", err)
+					matchedSession.conn.Close()
+				}
+			}
+		}
+	}
+
+	var contents []geminiContent
+	if !isReused {
+		model := targetModel
+		if model == "" {
+			model = "gemini-3.1-flash-live-preview"
+		}
+
+		modelLower := strings.ToLower(model)
+		var thinkingLevel string
+		if strings.Contains(modelLower, "extended-thinking") || strings.Contains(modelLower, "high") {
+			thinkingLevel = "HIGH"
+		} else if strings.Contains(modelLower, "low") {
+			thinkingLevel = "LOW"
+		} else if strings.Contains(modelLower, "minimal") {
+			thinkingLevel = "MINIMAL"
+		} else if strings.Contains(modelLower, "medium") {
+			thinkingLevel = "MEDIUM"
+		} else if strings.Contains(modelLower, "3.8") {
+			thinkingLevel = "LOW"
+		} else {
+			thinkingLevel = "HIGH"
+		}
+
+		if req.Thinking != nil && req.Thinking.ThinkingLevel != "" {
+			thinkingLevel = strings.ToUpper(string(req.Thinking.ThinkingLevel))
+		}
+
+		if !strings.HasPrefix(model, "models/") {
+			model = "models/" + model
+		}
+
+		wsURL := p.WSURL
+		if wsURL == "" {
+			wsURL = fmt.Sprintf("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=%s", url.QueryEscape(apiKey))
+		}
+
+		dialer := websocket.DefaultDialer
+		newConn, resp, err := dialer.DialContext(ctx, wsURL, nil)
+		if err != nil {
+			if resp != nil {
+				return nil, fmt.Errorf("google live ws dial failed with status %d: %w", resp.StatusCode, err)
+			}
+			return nil, fmt.Errorf("google live ws dial failed: %w", err)
+		}
+		conn = newConn
+
+		var systemInstructions []string
+		contents, systemInstructions = p.buildGeminiContents(req.Messages, true)
+		if req.SystemInstruction != "" {
+			systemInstructions = append([]string{req.SystemInstruction}, systemInstructions...)
+		}
+
+		modalities := p.ResponseModalities
+		if len(modalities) == 0 {
+			modalities = []string{"AUDIO"}
+		}
+
+		setupMsg := liveSetupMessage{
+			Setup: liveSetup{
+				Model: model,
+				GenerationConfig: &liveGenerationConfig{
+					ResponseModalities: modalities,
+					ThinkingConfig: &liveThinking{
+						IncludeThoughts: true,
+						ThinkingLevel:   thinkingLevel,
+					},
+				},
+				OutputAudioTranscription: map[string]any{},
 			},
-			OutputAudioTranscription: map[string]any{},
-		},
-	}
-
-	if len(systemInstructions) > 0 {
-		setupMsg.Setup.SystemInstruction = &geminiContent{
-			Parts: []geminiPart{{Text: strings.Join(systemInstructions, "\n\n")}},
 		}
-	}
 
-	if len(req.Tools) > 0 {
-		var funcDecls []geminiFunction
-		for _, tool := range req.Tools {
-			for _, fn := range tool.Functions {
-				funcDecls = append(funcDecls, geminiFunction{
-					Name:        fn.Name,
-					Description: fn.Description,
-					Parameters:  sanitizeGeminiSchemaMap(fn.Parameters),
-				})
-			}
-			if tool.Name != "" && len(tool.Functions) == 0 {
-				funcDecls = append(funcDecls, geminiFunction{
-					Name:        tool.Name,
-					Description: tool.Description,
-					Parameters:  sanitizeGeminiSchemaMap(tool.Parameters),
-				})
+		if len(systemInstructions) > 0 {
+			setupMsg.Setup.SystemInstruction = &geminiContent{
+				Parts: []geminiPart{{Text: strings.Join(systemInstructions, "\n\n")}},
 			}
 		}
-		if len(funcDecls) > 0 {
-			setupMsg.Setup.Tools = []liveTool{{FunctionDeclarations: funcDecls}}
+
+		if len(req.Tools) > 0 {
+			var funcDecls []geminiFunction
+			for _, tool := range req.Tools {
+				for _, fn := range tool.Functions {
+					funcDecls = append(funcDecls, geminiFunction{
+						Name:        fn.Name,
+						Description: fn.Description,
+						Parameters:  sanitizeGeminiSchemaMap(fn.Parameters),
+					})
+				}
+				if tool.Name != "" && len(tool.Functions) == 0 {
+					funcDecls = append(funcDecls, geminiFunction{
+						Name:        tool.Name,
+						Description: tool.Description,
+						Parameters:  sanitizeGeminiSchemaMap(tool.Parameters),
+					})
+				}
+			}
+			if len(funcDecls) > 0 {
+				setupMsg.Setup.Tools = []liveTool{{FunctionDeclarations: funcDecls}}
+			}
+		}
+
+		setupJSON, err := json.Marshal(setupMsg)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to marshal setup frame: %w", err)
+		}
+
+		if err := conn.WriteMessage(websocket.TextMessage, setupJSON); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to send setup frame: %w", err)
 		}
 	}
 
-	setupJSON, err := json.Marshal(setupMsg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal setup frame: %w", err)
-	}
-
-	if err := conn.WriteMessage(websocket.TextMessage, setupJSON); err != nil {
-		return nil, fmt.Errorf("failed to send setup frame: %w", err)
-	}
+	defer func() {
+		if !keepConnOpen && conn != nil {
+			conn.Close()
+		}
+	}()
 
 	var (
 		fullResponse CompletionResponse
@@ -1152,7 +1312,9 @@ func (p *GoogleProvider) chatWebSocket(ctx context.Context, apiKey string, targe
 	go func() {
 		select {
 		case <-ctx.Done():
-			conn.Close()
+			if !keepConnOpen && conn != nil {
+				conn.Close()
+			}
 		case <-doneChan:
 		}
 	}()
@@ -1243,8 +1405,18 @@ func (p *GoogleProvider) chatWebSocket(ctx context.Context, apiKey string, targe
 					}
 				}
 
-				if frame.ServerContent.TurnComplete {
+				if frame.ServerContent.TurnComplete || frame.ServerContent.GenerationComplete {
 					if len(fullResponse.ToolCalls) > 0 {
+						sess := &liveConnSession{
+							conn:      conn,
+							expiresAt: time.Now().Add(2 * time.Minute),
+						}
+						liveConnsLock.Lock()
+						for _, tc := range fullResponse.ToolCalls {
+							liveConns[tc.ID] = sess
+						}
+						liveConnsLock.Unlock()
+						keepConnOpen = true
 						return
 					}
 					if frame.ServerContent.InteractionStatus == "IN_PROGRESS" {
@@ -1255,6 +1427,11 @@ func (p *GoogleProvider) chatWebSocket(ctx context.Context, apiKey string, targe
 			}
 
 			if frame.ToolCall != nil && len(frame.ToolCall.FunctionCalls) > 0 {
+				sess := &liveConnSession{
+					conn:      conn,
+					expiresAt: time.Now().Add(2 * time.Minute),
+				}
+				liveConnsLock.Lock()
 				for _, fc := range frame.ToolCall.FunctionCalls {
 					funcName := fc.Name
 					prefixes := []string{"tool_use:", "tool_code:", "tool_call:", "call:"}
@@ -1279,10 +1456,13 @@ func (p *GoogleProvider) chatWebSocket(ctx context.Context, apiKey string, targe
 						},
 					}
 					fullResponse.ToolCalls = append(fullResponse.ToolCalls, tc)
+					liveConns[callID] = sess
 					if onChunk != nil {
 						onChunk(&CompletionResponse{ToolCalls: []ToolCall{tc}})
 					}
 				}
+				liveConnsLock.Unlock()
+				keepConnOpen = true
 				return
 			}
 		}
