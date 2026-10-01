@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -28,17 +29,6 @@ func (c ConfigEntry) GetType() string {
 	return c.Provider
 }
 
-type OllamaToolCallFunction struct {
-	Name      string         `json:"name"`
-	Arguments map[string]any `json:"arguments"`
-}
-
-type OllamaToolCall struct {
-	ID       string                 `json:"id,omitempty"`
-	Type     string                 `json:"type,omitempty"`
-	Function OllamaToolCallFunction `json:"function"`
-}
-
 type loggingResponseWriter struct {
 	http.ResponseWriter
 	statusCode int
@@ -47,92 +37,6 @@ type loggingResponseWriter struct {
 func (lrw *loggingResponseWriter) WriteHeader(code int) {
 	lrw.statusCode = code
 	lrw.ResponseWriter.WriteHeader(code)
-}
-
-type OllamaMessage struct {
-	Role      string           `json:"role"`
-	Content   string           `json:"content"`
-	Images    []string         `json:"images,omitempty"`
-	ToolCalls []OllamaToolCall `json:"tool_calls,omitempty"`
-}
-
-type OllamaTool struct {
-	Type     string         `json:"type"`
-	Function map[string]any `json:"function"`
-}
-
-type OllamaChatRequest struct {
-	Model     string          `json:"model"`
-	Messages  []OllamaMessage `json:"messages"`
-	Stream    bool            `json:"stream"`
-	Tools     []OllamaTool    `json:"tools,omitempty"`
-	SessionID string          `json:"session_id,omitempty"`
-	Thinking  *providers.ThinkingConfig `json:"thinking_config,omitempty"`
-}
-
-var sessionManager = NewSessionManager()
-
-type OllamaChatResponse struct {
-	Model     string        `json:"model"`
-	CreatedAt time.Time     `json:"created_at"`
-	Message   OllamaMessage `json:"message"`
-	Done      bool          `json:"done"`
-}
-
-type OllamaVersionResponse struct {
-	Version string `json:"version"`
-}
-
-type OllamaModel struct {
-	Name       string      `json:"name"`
-	Model      string      `json:"model"`
-	ModifiedAt string      `json:"modified_at"`
-	Size       int64       `json:"size"`
-	Digest     string      `json:"digest"`
-	Details    ModelDetail `json:"details"`
-}
-
-type ModelDetail struct {
-	ParentModel       string   `json:"parent_model"`
-	Format            string   `json:"format"`
-	Family            string   `json:"family"`
-	Families          []string `json:"families"`
-	ParameterSize     string   `json:"parameter_size"`
-	QuantizationLevel string   `json:"quantization_level"`
-}
-
-type OllamaTagsResponse struct {
-	Models []OllamaModel `json:"models"`
-}
-
-type OllamaGenerateRequest struct {
-	Model  string `json:"model"`
-	Prompt string `json:"prompt"`
-	Stream bool   `json:"stream"`
-}
-
-type OllamaGenerateResponse struct {
-	Model     string `json:"model"`
-	CreatedAt string `json:"created_at"`
-	Response  string `json:"response"`
-	Done      bool   `json:"done"`
-}
-
-type OllamaShowRequest struct {
-	Name  string `json:"name"`
-	Model string `json:"model"` // Some clients might use 'model' instead of 'name'
-}
-
-type OllamaShowResponse struct {
-	License      string         `json:"license"`
-	Modelfile    string         `json:"modelfile"`
-	Template     string         `json:"template"`
-	System       string         `json:"system"`
-	Details      ModelDetail    `json:"details"`
-	Capabilities []string       `json:"capabilities"`
-	ModifiedAt   string         `json:"modified_at"`
-	ModelInfo    map[string]any `json:"model_info"`
-	Tensors      []any          `json:"tensors"`
 }
 
 type OpenAIToolFunction struct {
@@ -189,10 +93,8 @@ type OpenAIChatCompletionRequest struct {
 }
 
 var (
-	geminiProvider     *providers.GeminiProvider
-	geminiLiveProvider *providers.GeminiLiveProvider
-	openaiProvider     *providers.OpenAIProvider
-	providersMap       = make(map[string]providers.Provider)
+	googleProvider providers.Provider
+	sessionManager = NewSessionManager()
 )
 
 func loadConfig(path string) ([]ConfigEntry, error) {
@@ -213,226 +115,51 @@ func main() {
 		log.Printf("Warning: could not load config.json: %v", err)
 	}
 
-	var geminiKeys []string
-	var geminiLiveKeys []string
-	var openaiKeys []string
+	var googleKeys []string
 
 	for _, entry := range config {
 		t := strings.ToLower(entry.GetType())
 		switch t {
-		case "gemini":
-			geminiKeys = append(geminiKeys, entry.Key)
-			geminiLiveKeys = append(geminiLiveKeys, entry.Key)
-		case "gemini-live", "live", "geminilive":
-			geminiLiveKeys = append(geminiLiveKeys, entry.Key)
-			geminiKeys = append(geminiKeys, entry.Key)
-		case "openai":
-			openaiKeys = append(openaiKeys, entry.Key)
+		case "google", "gemini", "gemini-live", "live":
+			if entry.Key != "" {
+				googleKeys = append(googleKeys, entry.Key)
+			}
 		default:
-			log.Printf("[CONFIG] Warning: unknown provider type %q in config", entry.GetType())
+			log.Printf("[CONFIG] Warning: ignored provider type %q in config", entry.GetType())
 		}
 	}
 
-	// Share keys between Gemini and Gemini Live if either is missing
-	if len(geminiLiveKeys) == 0 && len(geminiKeys) > 0 {
-		geminiLiveKeys = append(geminiLiveKeys, geminiKeys...)
-	}
-	if len(geminiKeys) == 0 && len(geminiLiveKeys) > 0 {
-		geminiKeys = append(geminiKeys, geminiLiveKeys...)
-	}
-	// Fallback to GEMINI_API_KEY environment variable if keys are empty
-	if envKey := os.Getenv("GEMINI_API_KEY"); envKey != "" {
-		if len(geminiKeys) == 0 {
-			geminiKeys = append(geminiKeys, envKey)
-		}
-		if len(geminiLiveKeys) == 0 {
-			geminiLiveKeys = append(geminiLiveKeys, envKey)
-		}
-	}
-	// Fallback to OPENAI_API_KEY environment variable if keys are empty
-	if envKey := os.Getenv("OPENAI_API_KEY"); envKey != "" {
-		if len(openaiKeys) == 0 {
-			openaiKeys = append(openaiKeys, envKey)
+	// Fallback to environment variables
+	if len(googleKeys) == 0 {
+		if envKey := os.Getenv("GEMINI_API_KEY"); envKey != "" {
+			googleKeys = append(googleKeys, envKey)
+		} else if envKey := os.Getenv("GOOGLE_API_KEY"); envKey != "" {
+			googleKeys = append(googleKeys, envKey)
 		}
 	}
 
-	log.Printf("[CONFIG] Loaded %d Gemini key(s), %d Gemini Live key(s), %d OpenAI key(s)", len(geminiKeys), len(geminiLiveKeys), len(openaiKeys))
+	log.Printf("[CONFIG] Loaded %d Google API key(s)", len(googleKeys))
 
-	if len(geminiKeys) > 0 {
-		geminiProvider = &providers.GeminiProvider{
-			BaseProvider: providers.BaseProvider{APIKeys: geminiKeys},
-		}
-		providersMap["gemini"] = geminiProvider
-	}
-	if len(geminiLiveKeys) > 0 {
-		geminiLiveProvider = providers.NewGeminiLiveProvider(geminiLiveKeys)
-		providersMap["gemini-live"] = geminiLiveProvider
-	}
-	if len(openaiKeys) > 0 {
-		openaiProvider = &providers.OpenAIProvider{
-			BaseProvider: providers.BaseProvider{APIKeys: openaiKeys},
-		}
-		providersMap["openai"] = openaiProvider
-	}
-
-
-	// Log directory creation commented out as requested
-	/*
-	if _, err := os.Stat("log"); os.IsNotExist(err) {
-		os.Mkdir("log", 0755)
-	}
-	*/
+	googleProvider = providers.NewGoogleProvider(googleKeys)
 
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
-		var req OllamaChatRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		for _, m := range req.Messages {
-			log.Printf("Client -> Proxy: [%s] %s", m.Role, m.Content)
-			if len(m.ToolCalls) > 0 {
-				log.Printf("Client -> Proxy: [tool_calls] %d calls", len(m.ToolCalls))
-			}
-		}
-		req.Model = normalizeModelName(req.Model)
-		handleChat(w, r, &req)
-	})
+	// OpenAI-compatible chat completions
+	mux.HandleFunc("/v1/chat/completions", handleChatCompletions)
+	mux.HandleFunc("/chat/completions", handleChatCompletions)
 
-	mux.HandleFunc("/api/generate", func(w http.ResponseWriter, r *http.Request) {
-		var req OllamaGenerateRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		log.Printf("Client -> Proxy: [prompt] %s", req.Prompt)
-		req.Model = normalizeModelName(req.Model)
-		handleGenerate(w, r, &req)
-	})
-
-	mux.HandleFunc("/api/version", func(w http.ResponseWriter, r *http.Request) {
-		resp := OllamaVersionResponse{Version: "0.11.8"}
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Header().Set("Ollama-Version", "0.11.8")
-		data, _ := json.Marshal(resp)
-		w.Write(data)
-	})
-
-	mux.HandleFunc("/api/tags", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[API] Listing models (/api/tags)...")
-		var allModels []OllamaModel
-		for pName, p := range providersMap {
-			models, err := p.ListModels(r.Context())
-			if err != nil {
-				log.Printf("[API] Error listing models for provider %s: %v", pName, err)
-				continue
-			}
-			log.Printf("[API] Provider %s returned %d models", pName, len(models))
-			for _, m := range models {
-				if len(allModels) >= 200 {
-					break
-				}
-				namespacedName := fmt.Sprintf("%s/%s:latest", pName, m.ID)
-				allModels = append(allModels, OllamaModel{
-					Name:       namespacedName,
-					Model:      namespacedName,
-					ModifiedAt: "2026-04-08T00:06:52.567291895+07:00",
-					Size:       4683087332,
-					Digest:     "845dbda0ea48ed749caafd9e6037047aa19acfcfd82e704d7ca97d631a0b697e",
-					Details: ModelDetail{
-						ParentModel:       "",
-						Format:            "gguf",
-						Family:            pName,
-						Families:          []string{pName},
-						ParameterSize:     "7.6B",
-						QuantizationLevel: "Q4_K_M",
-					},
-				})
-				bareName := m.ID + ":latest"
-				allModels = append(allModels, OllamaModel{
-					Name:       bareName,
-					Model:      bareName,
-					ModifiedAt: "2026-04-08T00:06:52.567291895+07:00",
-					Size:       4683087332,
-					Digest:     "845dbda0ea48ed749caafd9e6037047aa19acfcfd82e704d7ca97d631a0b697e",
-					Details: ModelDetail{
-						ParentModel:       "",
-						Format:            "gguf",
-						Family:            pName,
-						Families:          []string{pName},
-						ParameterSize:     "7.6B",
-						QuantizationLevel: "Q4_K_M",
-					},
-				})
-			}
-		}
-		log.Printf("[API] /api/tags returning %d model(s)", len(allModels))
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		data, _ := json.Marshal(OllamaTagsResponse{Models: allModels})
-		w.Write(data)
-	})
-
-	mux.HandleFunc("/api/ps", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Write([]byte(`{"models":[]}`))
-	})
-
-	mux.HandleFunc("/v1/models", handleOpenAIModels)
-	mux.HandleFunc("/models", handleOpenAIModels)
-	mux.HandleFunc("/v1/models/", handleOpenAIModels)
-	mux.HandleFunc("/models/", handleOpenAIModels)
-
-	mux.HandleFunc("/api/show", func(w http.ResponseWriter, r *http.Request) {
-		var req OllamaShowRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		// Fallback to Model if Name is empty
-		if req.Name == "" && req.Model != "" {
-			req.Name = req.Model
-		}
-
-		id := strings.TrimSuffix(req.Name, ":latest")
-		family := "gemini"
-		if strings.HasPrefix(id, "gpt-") {
-			family = "openai"
-		} else if strings.Contains(id, "live") || strings.Contains(id, "native-audio") {
-			family = "gemini-live"
-		}
-
-		resp := OllamaShowResponse{
-			License:   "",
-			Modelfile: "FROM " + req.Name,
-			Template:  "{{ .System }}\n{{ .Prompt }}",
-			Details: ModelDetail{
-				ParentModel:       "",
-				Format:            "gguf",
-				Family:            family,
-				Families:          []string{family},
-				ParameterSize:     "unknown",
-				QuantizationLevel: "Q4_0",
-			},
-			Capabilities: []string{"chat", "completion", "vision", "tools"},
-			ModifiedAt:   time.Now().Format(time.RFC3339Nano),
-			ModelInfo: map[string]any{
-				"general.architecture": family,
-			},
-			Tensors: []any{},
-		}
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		data, _ := json.Marshal(resp)
-		w.Write(data)
-	})
-
-	mux.HandleFunc("/v1/chat/completions", handleOpenAIChatCompletions)
-	mux.HandleFunc("/chat/completions", handleOpenAIChatCompletions)
+	// OpenAI-compatible models endpoints
+	mux.HandleFunc("/v1/models", handleModels)
+	mux.HandleFunc("/models", handleModels)
+	mux.HandleFunc("/v1/models/", handleModels)
+	mux.HandleFunc("/models/", handleModels)
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintln(w, "Ollama is running")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":  "ok",
+			"service": "google-ai-proxy",
+		})
 	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -445,8 +172,6 @@ func main() {
 		} else {
 			w.Header().Set("Access-Control-Allow-Headers", "*")
 		}
-		w.Header().Set("Access-Control-Expose-Headers", "Ollama-Version, X-Ollama-Version")
-		w.Header().Set("Ollama-Version", "0.11.8")
 
 		lrw := &loggingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 
@@ -484,7 +209,7 @@ func main() {
 		addr := fmt.Sprintf("%s:%s", host, p)
 		listener, err := net.Listen("tcp", addr)
 		if err == nil {
-			fmt.Printf("Ollama-One proxy starting on http://%s...\n", addr)
+			fmt.Printf("Google AI Proxy starting on http://%s...\n", addr)
 			if err := http.Serve(listener, handler); err != nil {
 				fmt.Printf("Error running server: %v\n", err)
 			}
@@ -492,418 +217,6 @@ func main() {
 		}
 		fmt.Printf("Port %s unavailable (%v), trying next port...\n", p, err)
 	}
-}
-
-func getProvider(model string) (providers.Provider, string) {
-	fullModel := strings.TrimSpace(model)
-	fullModel = strings.TrimSuffix(fullModel, ":latest")
-
-	// 1. Explicit Provider Namespace: {provider}/{modelName} or {provider}:{modelName}
-	// e.g. "gemini/gemini-2.0-flash", "openai/gpt-4o", "gemini-live/gemini-3.1-flash-live-preview", "live/gemini-3.1-flash-live-preview"
-	if idx := strings.IndexAny(fullModel, "/:"); idx != -1 {
-		providerPrefix := strings.ToLower(fullModel[:idx])
-		actualModelName := fullModel[idx+1:]
-		if (providerPrefix == "live" || providerPrefix == "gemini-live") && geminiLiveProvider != nil {
-			log.Printf("[ROUTE] Explicit namespace %q -> Provider: gemini-live, Target Model: %s", model, actualModelName)
-			return geminiLiveProvider, actualModelName
-		}
-		if p, ok := providersMap[providerPrefix]; ok {
-			log.Printf("[ROUTE] Explicit namespace %q -> Provider: %s, Target Model: %s", model, providerPrefix, actualModelName)
-			return p, actualModelName
-		}
-	}
-
-	// 2. Gemini Live model detection by model name pattern
-	modelLower := strings.ToLower(fullModel)
-	if geminiLiveProvider != nil && (strings.Contains(modelLower, "live") || strings.Contains(modelLower, "native-audio")) {
-		log.Printf("[ROUTE] Live model pattern match -> Provider: gemini-live, Model: %s", fullModel)
-		return geminiLiveProvider, fullModel
-	}
-
-	// 3. OpenAI model pattern match
-	if strings.HasPrefix(modelLower, "gpt-") || strings.HasPrefix(modelLower, "o1") || strings.HasPrefix(modelLower, "o3") || strings.HasPrefix(modelLower, "chatgpt") {
-		if openaiProvider != nil {
-			log.Printf("[ROUTE] OpenAI model pattern match -> Provider: openai, Model: %s", fullModel)
-			return openaiProvider, fullModel
-		}
-		// If openaiProvider not configured, alias to geminiProvider so it doesn't fail
-		if geminiProvider != nil {
-			log.Printf("[ROUTE] OpenAI model %q requested but no OpenAI key; routing to Gemini -> Model: gemini-2.0-flash", fullModel)
-			return geminiProvider, "gemini-2.0-flash"
-		}
-	}
-
-	// 4. Gemini model pattern match
-	if strings.HasPrefix(modelLower, "gemini") || strings.HasPrefix(modelLower, "learnlm") {
-		if geminiProvider != nil {
-			log.Printf("[ROUTE] Gemini model pattern match -> Provider: gemini, Model: %s", fullModel)
-			return geminiProvider, fullModel
-		}
-	}
-
-	// 5. Single active provider: route everything to it
-	if len(providersMap) == 1 {
-		for pName, p := range providersMap {
-			log.Printf("[ROUTE] Single active provider %q -> Model: %s", pName, fullModel)
-			return p, fullModel
-		}
-	}
-
-	// 6. Provider name prefix match
-	for pName, p := range providersMap {
-		if strings.HasPrefix(modelLower, pName) {
-			log.Printf("[ROUTE] Provider prefix match -> Provider: %s, Model: %s", pName, fullModel)
-			return p, fullModel
-		}
-	}
-
-	// 7. Default fallback to registered provider
-	if geminiProvider != nil {
-		log.Printf("[ROUTE] Fallback -> Provider: gemini, Model: %s", fullModel)
-		return geminiProvider, fullModel
-	}
-	for pName, p := range providersMap {
-		log.Printf("[ROUTE] Fallback -> Provider: %s, Model: %s", pName, fullModel)
-		return p, fullModel
-	}
-
-	log.Printf("[ROUTE] Warning: No active provider found for model %q, defaulting to geminiProvider", fullModel)
-	return geminiProvider, fullModel
-}
-
-func normalizeModelName(model string) string {
-	model = strings.TrimSpace(model)
-	return strings.TrimSuffix(model, ":latest")
-}
-
-func handleGenerate(w http.ResponseWriter, r *http.Request, req *OllamaGenerateRequest) {
-	provider, targetModel := getProvider(req.Model)
-	req.Model = targetModel
-	internalReq := &providers.CompletionRequest{
-		Model: req.Model,
-		Messages: []providers.Message{
-			{
-				Role: "user",
-				Content: []providers.ContentPart{
-					{Type: providers.ContentTypeText, Text: req.Prompt},
-				},
-			},
-		},
-		Stream: req.Stream,
-	}
-
-	if req.Stream {
-		w.Header().Set("Content-Type", "application/json")
-		flusher, ok := w.(http.Flusher)
-		var fullResponse providers.CompletionResponse
-		_, err := provider.Chat(r.Context(), internalReq, func(chunk *providers.CompletionResponse) {
-			fullResponse.Content += chunk.Content
-			resp := OllamaGenerateResponse{
-				Model:    req.Model,
-				Response: chunk.Content,
-				Done:     false,
-			}
-			json.NewEncoder(w).Encode(resp)
-			log.Printf("Provider -> Proxy: %s", chunk.Content)
-			if ok {
-				flusher.Flush()
-			}
-		})
-		if err == nil {
-			finalResp := OllamaGenerateResponse{Model: req.Model, Done: true}
-			json.NewEncoder(w).Encode(finalResp)
-			log.Printf("Proxy -> Client: [DONE]")
-			logInteraction(req.Model, []OllamaMessage{{Role: "user", Content: req.Prompt}}, nil, &fullResponse, finalResp)
-		}
-	} else {
-		resp, err := provider.Chat(r.Context(), internalReq, nil)
-		if err == nil {
-			w.Header().Set("Content-Type", "application/json")
-			finalResp := OllamaGenerateResponse{
-				Model:    req.Model,
-				Response: resp.Content,
-				Done:     true,
-			}
-			json.NewEncoder(w).Encode(finalResp)
-			log.Printf("Provider -> Proxy: %s", resp.Content)
-			log.Printf("Proxy -> Client: [FULL RESPONSE]")
-			logInteraction(req.Model, []OllamaMessage{{Role: "user", Content: req.Prompt}}, nil, resp, finalResp)
-		} else {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-	}
-}
-
-func handleChat(w http.ResponseWriter, r *http.Request, req *OllamaChatRequest) {
-	provider, targetModel := getProvider(req.Model)
-	req.Model = targetModel
-
-	internalMessages := make([]providers.Message, len(req.Messages))
-	for i, m := range req.Messages {
-		parts := []providers.ContentPart{
-			{
-				Type: providers.ContentTypeText,
-				Text: m.Content,
-			},
-		}
-		for _, img := range m.Images {
-			if cp, err := parseImageURLToContentPart(img); err == nil {
-				parts = append(parts, cp)
-			} else {
-				parts = append(parts, providers.ContentPart{
-					Type:     providers.ContentTypeImage,
-					MimeType: "image/jpeg",
-					Data:     []byte(img),
-				})
-			}
-		}
-		internalMessages[i] = providers.Message{
-			Role:    m.Role,
-			Content: parts,
-		}
-	}
-
-	// Convert OllamaTool objects to providers.Tool objects
-	var internalTools []providers.Tool
-	for _, tool := range req.Tools {
-		t := providers.Tool{
-			Type: tool.Type,
-		}
-		if tool.Function != nil {
-			// Extract function details from the map
-			funcTool := providers.Tool{
-				Type: "function",
-			}
-			if name, ok := tool.Function["name"].(string); ok {
-				funcTool.Name = name
-			}
-			if desc, ok := tool.Function["description"].(string); ok {
-				funcTool.Description = desc
-			}
-			if params, ok := tool.Function["parameters"].(map[string]any); ok {
-				funcTool.Parameters = params
-			}
-			t.Functions = append(t.Functions, funcTool)
-		}
-		internalTools = append(internalTools, t)
-	}
-
-	internalReq := &providers.CompletionRequest{
-		Model:    req.Model,
-		Messages: internalMessages,
-		Stream:   req.Stream,
-		Tools:    internalTools,
-		Thinking: req.Thinking,
-	}
-
-	// Handle Sessions
-	var session *Session
-	if req.SessionID != "" {
-		session = sessionManager.GetSession(req.SessionID)
-		
-		// If client sends messages, we try to detect if it's a new turn
-		if len(internalReq.Messages) > 0 {
-			lastClientMsg := internalReq.Messages[len(internalReq.Messages)-1]
-			
-			// If session is empty, just use client's messages
-			if len(session.Messages) == 0 {
-				session.Messages = internalReq.Messages
-			} else {
-				// Check if the last client message is already in session
-				// If not, it's a new message from the user
-				found := false
-				for _, m := range session.Messages {
-					if m.Role == lastClientMsg.Role && len(m.Content) > 0 && len(lastClientMsg.Content) > 0 && m.Content[0].Text == lastClientMsg.Content[0].Text {
-						found = true
-						break
-					}
-				}
-				
-				if !found {
-					session.Messages = append(session.Messages, lastClientMsg)
-				}
-			}
-			// Use session messages for the actual request
-			internalReq.Messages = session.Messages
-			log.Printf("Using session %s history (length: %d)", req.SessionID, len(internalReq.Messages))
-		}
-	}
-
-	if req.Stream {
-		var fullResponse providers.CompletionResponse
-		flusher, ok := w.(http.Flusher)
-		_, err := provider.Chat(r.Context(), internalReq, func(chunk *providers.CompletionResponse) {
-			fullResponse.Content += chunk.Content
-			if len(chunk.ToolCalls) > 0 {
-				fullResponse.ToolCalls = append(fullResponse.ToolCalls, chunk.ToolCalls...)
-			}
-
-			var ollamaTCs []OllamaToolCall
-			if len(chunk.ToolCalls) > 0 {
-				for _, tc := range chunk.ToolCalls {
-					var args map[string]any
-					if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-						args = make(map[string]any)
-					}
-					log.Printf("Provider -> Proxy (Tool Call): %s(%v)", tc.Function.Name, args)
-					ollamaTCs = append(ollamaTCs, OllamaToolCall{
-						ID:   tc.ID,
-						Type: tc.Type,
-						Function: OllamaToolCallFunction{
-							Name:      tc.Function.Name,
-							Arguments: args,
-						},
-					})
-				}
-			}
-
-			respChunk := OllamaChatResponse{
-				Model:     req.Model,
-				CreatedAt: time.Now(),
-				Message: OllamaMessage{
-					Role:      "assistant",
-					Content:   chunk.Content,
-					ToolCalls: ollamaTCs,
-				},
-				Done: false,
-			}
-			json.NewEncoder(w).Encode(respChunk)
-			log.Printf("Proxy -> Client: %s", chunk.Content)
-			if ok {
-				flusher.Flush()
-			}
-		})
-
-		if err == nil {
-			// Update Session with full assistant response
-			if session != nil {
-				assistantMsg := providers.Message{
-					Role:      "assistant",
-					Content:   []providers.ContentPart{{Type: providers.ContentTypeText, Text: fullResponse.Content}},
-					ToolCalls: fullResponse.ToolCalls,
-				}
-				session.Messages = append(session.Messages, assistantMsg)
-				log.Printf("Updated session %s with assistant message (length: %d)", session.ID, len(session.Messages))
-			}
-
-			var finalOllamaTCs []OllamaToolCall
-			for _, tc := range fullResponse.ToolCalls {
-				var args map[string]any
-				if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-					args = make(map[string]any)
-				}
-				finalOllamaTCs = append(finalOllamaTCs, OllamaToolCall{
-					ID:   tc.ID,
-					Type: tc.Type,
-					Function: OllamaToolCallFunction{
-						Name:      tc.Function.Name,
-						Arguments: args,
-					},
-				})
-			}
-
-			finalResp := OllamaChatResponse{
-				Model:     req.Model,
-				CreatedAt: time.Now(),
-				Message: OllamaMessage{
-					Role:      "assistant",
-					Content:   "",
-					ToolCalls: finalOllamaTCs,
-				},
-				Done: true,
-			}
-			json.NewEncoder(w).Encode(finalResp)
-			
-			log.Printf("Proxy -> Client: [DONE]")
-			logInteraction(req.Model, req.Messages, req.Tools, &fullResponse, finalResp)
-		} else {
-			log.Printf("Provider error: %v", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-	} else {
-		resp, err := provider.Chat(r.Context(), internalReq, nil)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		
-		// Update Session
-		if session != nil {
-			assistantMsg := providers.Message{
-				Role:      "assistant",
-				Content:   []providers.ContentPart{{Type: providers.ContentTypeText, Text: resp.Content}},
-				ToolCalls: resp.ToolCalls,
-			}
-			session.Messages = append(session.Messages, assistantMsg)
-		}
-
-		var ollamaTCs []OllamaToolCall
-		for _, tc := range resp.ToolCalls {
-			var args map[string]any
-			if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
-				args = make(map[string]any)
-			}
-			ollamaTCs = append(ollamaTCs, OllamaToolCall{
-				ID:   tc.ID,
-				Type: tc.Type,
-				Function: OllamaToolCallFunction{
-					Name:      tc.Function.Name,
-					Arguments: args,
-				},
-			})
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		finalResp := OllamaChatResponse{
-			Model:     req.Model,
-			CreatedAt: time.Now(),
-			Message: OllamaMessage{
-				Role:      "assistant",
-				Content:   resp.Content,
-				ToolCalls: ollamaTCs,
-			},
-			Done: true,
-		}
-		json.NewEncoder(w).Encode(finalResp)
-		log.Printf("Provider -> Proxy: %s", resp.Content)
-		log.Printf("Proxy -> Client: [FULL RESPONSE]")
-		logInteraction(req.Model, req.Messages, req.Tools, resp, finalResp)
-	}
-}
-
-func logInteraction(model string, messages []OllamaMessage, tools []OllamaTool, providerResponse *providers.CompletionResponse, clientResponse any) {
-	// Interaction logging to file commented out as requested
-	/*
-	timestamp := time.Now().Format("20060102_150405")
-	filename := filepath.Join("log", fmt.Sprintf("chat_%s_%s.log", timestamp, strings.ReplaceAll(model, ":", "_")))
-
-	var logData struct {
-		Timestamp time.Time `json:"timestamp"`
-		Model     string    `json:"model"`
-		ClientRequest struct {
-			Messages []OllamaMessage `json:"messages"`
-			Tools    []OllamaTool    `json:"tools,omitempty"`
-		} `json:"client_request"`
-		ProviderResponse *providers.CompletionResponse `json:"provider_response"`
-		ClientResponse   any                          `json:"client_response"`
-	}
-	logData.Timestamp = time.Now()
-	logData.Model = model
-	logData.ClientRequest.Messages = messages
-	logData.ClientRequest.Tools = tools
-	logData.ProviderResponse = providerResponse
-	logData.ClientResponse = clientResponse
-
-	data, err := json.MarshalIndent(logData, "", "  ")
-	if err != nil {
-		log.Printf("Error marshaling log data: %v", err)
-		return
-	}
-
-	if err := os.WriteFile(filename, data, 0644); err != nil {
-		log.Printf("Error writing log file: %v", err)
-	}
-	*/
 }
 
 func extractOpenAITextContent(content any) string {
@@ -930,7 +243,7 @@ func extractOpenAITextContent(content any) string {
 	}
 }
 
-func handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
+func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var req OpenAIChatCompletionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadRequest)
@@ -939,10 +252,7 @@ func handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if req.Model == "" {
 		req.Model = "gemini-2.0-flash"
 	}
-
-	req.Model = normalizeModelName(req.Model)
-	provider, targetModel := getProvider(req.Model)
-	req.Model = targetModel
+	req.Model = strings.TrimSpace(strings.TrimSuffix(req.Model, ":latest"))
 
 	// Convert Tools
 	var internalTools []providers.Tool
@@ -1043,8 +353,30 @@ func handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
 			ToolCalls:  tcs,
 		}
 
-		textContent := extractOpenAITextContent(m.Content)
-		log.Printf("Client -> Proxy (OpenAI): [%s] %s (parts: %d, tool_calls: %d)", m.Role, textContent, len(parts), len(tcs))
+		logText := extractOpenAITextContent(m.Content)
+		if len(parts) > 0 && parts[0].Text != "" {
+			logText = parts[0].Text
+		}
+
+		displayLogText := logText
+		if m.Role == "system" || m.Role == "developer" {
+			firstLine := strings.SplitN(strings.TrimSpace(logText), "\n", 2)[0]
+			if len(firstLine) > 100 {
+				firstLine = firstLine[:100] + "..."
+			}
+			displayLogText = fmt.Sprintf("%s (%d chars)", firstLine, len(logText))
+		} else if len(displayLogText) > 400 {
+			displayLogText = displayLogText[:400] + fmt.Sprintf("... [truncated %d chars]", len(logText)-400)
+		}
+
+		log.Printf("Client -> Proxy: [%s] %s (parts: %d, tool_calls: %d)", m.Role, displayLogText, len(parts), len(tcs))
+
+		if m.Role == "tool" {
+			log.Printf("[DEBUG][CLIENT -> PROXY] Tool Result | CallID: %s, Name: %s, Result: %s", m.ToolCallID, m.Name, displayLogText)
+		}
+		for _, tc := range tcs {
+			log.Printf("[DEBUG][CLIENT -> PROXY] Past Tool Call | ID: %s, Function: %s, Arguments: %s", tc.ID, tc.Function.Name, tc.Function.Arguments)
+		}
 	}
 
 	internalReq := &providers.CompletionRequest{
@@ -1098,13 +430,13 @@ func handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
 		flusher, ok := w.(http.Flusher)
 		hasToolCalls := false
 
-		// Emit initial role chunk immediately so clients like VS Code Copilot receive choices right away
+		// Emit initial role chunk immediately for VS Code Copilot
 		initChunk := map[string]any{
 			"id":                 completionID,
 			"object":             "chat.completion.chunk",
 			"created":            createdTime,
 			"model":              req.Model,
-			"system_fingerprint": "fp_ollama_one",
+			"system_fingerprint": "fp_google_proxy",
 			"choices": []any{
 				map[string]any{
 					"index":         0,
@@ -1122,7 +454,7 @@ func handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
 		var fullContent strings.Builder
 		var allStreamToolCalls []providers.ToolCall
 
-		_, err := provider.Chat(r.Context(), internalReq, func(chunk *providers.CompletionResponse) {
+		_, err := googleProvider.Chat(r.Context(), internalReq, func(chunk *providers.CompletionResponse) {
 			delta := map[string]any{}
 
 			if chunk.Content != "" {
@@ -1143,6 +475,7 @@ func handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
 					if tcArgs == "" {
 						tcArgs = "{}"
 					}
+					log.Printf("[DEBUG][PROXY -> CLIENT] Stream Tool Call | Index: %d, ID: %s, Function: %s, Arguments: %s", i, tcID, tc.Function.Name, tcArgs)
 					openaiTCs = append(openaiTCs, map[string]any{
 						"index": i,
 						"id":    tcID,
@@ -1165,7 +498,7 @@ func handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
 				"object":             "chat.completion.chunk",
 				"created":            createdTime,
 				"model":              req.Model,
-				"system_fingerprint": "fp_ollama_one",
+				"system_fingerprint": "fp_google_proxy",
 				"choices": []any{
 					map[string]any{
 						"index":         0,
@@ -1183,13 +516,13 @@ func handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
 		})
 
 		if err != nil {
-			log.Printf("[OpenAI] Streaming chat error: %v", err)
+			log.Printf("[Stream] Chat error: %v", err)
 			errChunk := map[string]any{
 				"id":                 completionID,
 				"object":             "chat.completion.chunk",
 				"created":            createdTime,
 				"model":              req.Model,
-				"system_fingerprint": "fp_ollama_one",
+				"system_fingerprint": "fp_google_proxy",
 				"choices": []any{
 					map[string]any{
 						"index":         0,
@@ -1225,7 +558,7 @@ func handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
 			"object":             "chat.completion.chunk",
 			"created":            createdTime,
 			"model":              req.Model,
-			"system_fingerprint": "fp_ollama_one",
+			"system_fingerprint": "fp_google_proxy",
 			"choices": []any{
 				map[string]any{
 					"index":         0,
@@ -1246,7 +579,7 @@ func handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
 				"object":             "chat.completion.chunk",
 				"created":            createdTime,
 				"model":              req.Model,
-				"system_fingerprint": "fp_ollama_one",
+				"system_fingerprint": "fp_google_proxy",
 				"choices": []any{
 					map[string]any{
 						"index":         0,
@@ -1271,16 +604,16 @@ func handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := provider.Chat(r.Context(), internalReq, nil)
+	resp, err := googleProvider.Chat(r.Context(), internalReq, nil)
 	if err != nil {
-		log.Printf("[OpenAI] Chat completion error: %v", err)
+		log.Printf("[Chat] Error: %v", err)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(map[string]any{
 			"id":                 completionID,
 			"object":             "chat.completion",
 			"created":            createdTime,
 			"model":              req.Model,
-			"system_fingerprint": "fp_ollama_one",
+			"system_fingerprint": "fp_google_proxy",
 			"choices": []any{
 				map[string]any{
 					"index": 0,
@@ -1314,9 +647,7 @@ func handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
 		finishReason = "tool_calls"
 	}
 
-	msgObj := map[string]any{
-		"role": "assistant",
-	}
+	msgObj := map[string]any{"role": "assistant"}
 	if hasToolCalls && resp.Content == "" {
 		msgObj["content"] = nil
 	} else {
@@ -1334,6 +665,7 @@ func handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
 			if tcArgs == "" {
 				tcArgs = "{}"
 			}
+			log.Printf("[DEBUG][PROXY -> CLIENT] Non-Stream Tool Call | Index: %d, ID: %s, Function: %s, Arguments: %s", i, tcID, tc.Function.Name, tcArgs)
 			openaiTCs = append(openaiTCs, map[string]any{
 				"id":   tcID,
 				"type": "function",
@@ -1354,7 +686,7 @@ func handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
 		"object":             "chat.completion",
 		"created":            createdTime,
 		"model":              req.Model,
-		"system_fingerprint": "fp_ollama_one",
+		"system_fingerprint": "fp_google_proxy",
 		"choices": []any{
 			map[string]any{
 				"index":         0,
@@ -1373,8 +705,7 @@ func handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(finalResp)
 }
 
-func handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[API] Handling models request: %s %s", r.Method, r.URL.Path)
+func handleModels(w http.ResponseWriter, r *http.Request) {
 	type openAIModel struct {
 		ID      string `json:"id"`
 		Object  string `json:"object"`
@@ -1387,42 +718,29 @@ func handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 	path = strings.TrimPrefix(path, "/")
 
 	if path != "" {
-		modelID := path
-		providerName := "ollama-one"
-		if idx := strings.Index(modelID, "/"); idx != -1 {
-			providerName = modelID[:idx]
-		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(openAIModel{
-			ID:      modelID,
+			ID:      path,
 			Object:  "model",
 			Created: 1700000000,
-			OwnedBy: providerName,
+			OwnedBy: "google",
 		})
 		return
 	}
 
+	models, err := googleProvider.ListModels(r.Context())
+	if err != nil {
+		log.Printf("[API] Error listing models: %v", err)
+	}
+
 	var modelsList []openAIModel
-	for pName, p := range providersMap {
-		models, err := p.ListModels(r.Context())
-		if err != nil {
-			log.Printf("[API] Error listing models for provider %s: %v", pName, err)
-			continue
-		}
-		for _, m := range models {
-			modelsList = append(modelsList, openAIModel{
-				ID:      fmt.Sprintf("%s/%s", pName, m.ID),
-				Object:  "model",
-				Created: 1700000000,
-				OwnedBy: pName,
-			})
-			modelsList = append(modelsList, openAIModel{
-				ID:      m.ID,
-				Object:  "model",
-				Created: 1700000000,
-				OwnedBy: pName,
-			})
-		}
+	for _, m := range models {
+		modelsList = append(modelsList, openAIModel{
+			ID:      m.ID,
+			Object:  "model",
+			Created: 1700000000,
+			OwnedBy: "google",
+		})
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -1430,6 +748,31 @@ func handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 		"object": "list",
 		"data":   modelsList,
 	})
+}
+
+var (
+	userRequestRegex = regexp.MustCompile(`(?s)<userRequest>\s*(.*?)\s*</userRequest>`)
+	reminderRegex    = regexp.MustCompile(`(?s)<reminderInstructions>.*?</reminderInstructions>`)
+)
+
+func cleanUserPrompt(text string) string {
+	matches := userRequestRegex.FindAllStringSubmatch(text, -1)
+	if len(matches) > 0 {
+		var extracted []string
+		for _, m := range matches {
+			if len(m) > 1 && strings.TrimSpace(m[1]) != "" {
+				extracted = append(extracted, strings.TrimSpace(m[1]))
+			}
+		}
+		if len(extracted) > 0 {
+			return strings.Join(extracted, "\n\n")
+		}
+	}
+	if reminderRegex.MatchString(text) {
+		text = reminderRegex.ReplaceAllString(text, "")
+		text = strings.TrimSpace(text)
+	}
+	return text
 }
 
 func parseOpenAIMessageParts(content any, images []string) []providers.ContentPart {
@@ -1441,7 +784,7 @@ func parseOpenAIMessageParts(content any, images []string) []providers.ContentPa
 			if c != "" {
 				parts = append(parts, providers.ContentPart{
 					Type: providers.ContentTypeText,
-					Text: c,
+					Text: cleanUserPrompt(c),
 				})
 			}
 		case []any:
@@ -1451,7 +794,7 @@ func parseOpenAIMessageParts(content any, images []string) []providers.ContentPa
 					if p != "" {
 						parts = append(parts, providers.ContentPart{
 							Type: providers.ContentTypeText,
-							Text: p,
+							Text: cleanUserPrompt(p),
 						})
 					}
 				case map[string]any:
@@ -1461,7 +804,7 @@ func parseOpenAIMessageParts(content any, images []string) []providers.ContentPa
 						if text, ok := p["text"].(string); ok && text != "" {
 							parts = append(parts, providers.ContentPart{
 								Type: providers.ContentTypeText,
-								Text: text,
+								Text: cleanUserPrompt(text),
 							})
 						}
 					case "image_url":
@@ -1496,7 +839,7 @@ func parseOpenAIMessageParts(content any, images []string) []providers.ContentPa
 						if text, ok := p["text"].(string); ok && text != "" {
 							parts = append(parts, providers.ContentPart{
 								Type: providers.ContentTypeText,
-								Text: text,
+								Text: cleanUserPrompt(text),
 							})
 						}
 					}
