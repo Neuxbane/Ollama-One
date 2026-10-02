@@ -12,10 +12,10 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 )
@@ -79,20 +79,30 @@ func (p *GoogleProvider) getBaseURL() string {
 
 // ListModels fetches available models from the Google API and appends WebSocket live models
 func (p *GoogleProvider) ListModels(ctx context.Context) ([]ModelInfo, error) {
-	key := p.GetNextKey()
+	return p.ListModelsWithKey(ctx, "")
+}
+
+// ListModelsWithKey fetches available models using a specific API key (if provided) or configured keys
+func (p *GoogleProvider) ListModelsWithKey(ctx context.Context, apiKey string) ([]ModelInfo, error) {
+	key := apiKey
 	if key == "" {
-		key = os.Getenv("GEMINI_API_KEY")
+		key = p.GetNextKey()
 		if key == "" {
-			key = os.Getenv("GOOGLE_API_KEY")
+			key = os.Getenv("GEMINI_API_KEY")
+			if key == "" {
+				key = os.Getenv("GOOGLE_API_KEY")
+			}
 		}
-	}
-	if key == "" {
-		return nil, fmt.Errorf("no google api key configured")
 	}
 
 	var models []ModelInfo
 	// Add live models first
 	models = append(models, SupportedLiveModels...)
+
+	if key == "" {
+		// In stateless mode without a key, return statically known supported models
+		return models, nil
+	}
 
 	pageToken := ""
 	for {
@@ -167,24 +177,210 @@ func (p *GoogleProvider) ListModels(ctx context.Context) ([]ModelInfo, error) {
 	return models, nil
 }
 
+func getMaxRetries() int {
+	if val := os.Getenv("GEMINI_MAX_RETRIES"); val != "" {
+		if n, err := strconv.Atoi(val); err == nil && n >= 1 {
+			return n
+		}
+	}
+	return 3
+}
+
+func parseKeys(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	var keys []string
+	for _, k := range strings.Split(raw, ",") {
+		k = strings.TrimSpace(k)
+		if k != "" {
+			keys = append(keys, k)
+		}
+	}
+	return keys
+}
+
+func (p *GoogleProvider) getKeyForAttempt(attempt int, reqKey string) string {
+	parsedReqKeys := parseKeys(reqKey)
+	if len(parsedReqKeys) > 1 {
+		return parsedReqKeys[attempt%len(parsedReqKeys)]
+	}
+
+	if attempt == 0 {
+		if len(parsedReqKeys) == 1 {
+			return parsedReqKeys[0]
+		}
+		key := p.GetNextKey()
+		if key != "" {
+			return key
+		}
+		if envKey := os.Getenv("GEMINI_API_KEY"); envKey != "" {
+			keys := parseKeys(envKey)
+			if len(keys) > 0 {
+				return keys[0]
+			}
+		}
+		if envKey := os.Getenv("GOOGLE_API_KEY"); envKey != "" {
+			keys := parseKeys(envKey)
+			if len(keys) > 0 {
+				return keys[0]
+			}
+		}
+		return ""
+	}
+
+	// Retry attempts (attempt > 0)
+	if len(p.APIKeys) > 1 {
+		return p.GetNextKey()
+	}
+	if len(parsedReqKeys) == 1 {
+		return parsedReqKeys[0]
+	}
+	key := p.GetNextKey()
+	if key != "" {
+		return key
+	}
+	if envKey := os.Getenv("GEMINI_API_KEY"); envKey != "" {
+		keys := parseKeys(envKey)
+		if len(keys) > 0 {
+			return keys[attempt%len(keys)]
+		}
+	}
+	if envKey := os.Getenv("GOOGLE_API_KEY"); envKey != "" {
+		keys := parseKeys(envKey)
+		if len(keys) > 0 {
+			return keys[attempt%len(keys)]
+		}
+	}
+	return ""
+}
+
+func (p *GoogleProvider) isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	if strings.Contains(errStr, "429") ||
+		strings.Contains(errStr, "resource_exhausted") ||
+		strings.Contains(errStr, "quota") ||
+		strings.Contains(errStr, "rate limit") ||
+		strings.Contains(errStr, "too many requests") {
+		return true
+	}
+	if strings.Contains(errStr, "500") ||
+		strings.Contains(errStr, "502") ||
+		strings.Contains(errStr, "503") ||
+		strings.Contains(errStr, "504") ||
+		strings.Contains(errStr, "internal") ||
+		strings.Contains(errStr, "unavailable") ||
+		strings.Contains(errStr, "bad gateway") ||
+		strings.Contains(errStr, "service unavailable") {
+		return true
+	}
+	if strings.Contains(errStr, "eof") ||
+		strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "dial failed") ||
+		strings.Contains(errStr, "close 1000") ||
+		strings.Contains(errStr, "close 1006") ||
+		strings.Contains(errStr, "closed network connection") ||
+		strings.Contains(errStr, "websocket: close") ||
+		strings.Contains(errStr, "empty response") ||
+		strings.Contains(errStr, "timeout") {
+		return true
+	}
+	if strings.Contains(errStr, "401") || strings.Contains(errStr, "403") {
+		return len(p.APIKeys) > 1
+	}
+	return false
+}
+
 // Chat routes the request strictly:
 // - "google/ws/<model>" routes to WebSocket Live
 // - "google/<model>" (or default) routes to Google REST API
+// It performs auto-retries on transient errors, rate limits (429), server errors (5xx), and empty responses.
 func (p *GoogleProvider) Chat(ctx context.Context, req *CompletionRequest, onChunk func(*CompletionResponse)) (*CompletionResponse, error) {
-	key := p.GetNextKey()
-	if key == "" {
-		return nil, fmt.Errorf("no google api key configured")
+	if PreChatHook != nil {
+		if err := PreChatHook(req); err != nil {
+			return nil, err
+		}
 	}
 
-	rawModel := strings.TrimSpace(req.Model)
+	maxRetries := getMaxRetries()
+	var lastErr error
 
-	if strings.HasPrefix(rawModel, "google/ws/") {
-		targetModel := strings.TrimPrefix(rawModel, "google/ws/")
-		return p.chatWebSocket(ctx, key, targetModel, req, onChunk)
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		key := p.getKeyForAttempt(attempt, req.APIKey)
+		if key == "" {
+			return nil, fmt.Errorf("no Google API key provided in request (via 'Authorization: Bearer <key>', 'x-api-key', or '?key=<key>') or in config/env")
+		}
+
+		chunksYielded := 0
+		safeChunkHandler := func(chunk *CompletionResponse) {
+			if chunk != nil && (chunk.Content != "" || len(chunk.ToolCalls) > 0 || chunk.Thought != "") {
+				chunksYielded++
+				if onChunk != nil {
+					onChunk(chunk)
+				}
+			}
+		}
+
+		rawModel := strings.TrimSpace(req.Model)
+		var resp *CompletionResponse
+		var err error
+
+		if strings.HasPrefix(rawModel, "google/ws/") {
+			targetModel := strings.TrimPrefix(rawModel, "google/ws/")
+			resp, err = p.chatWebSocket(ctx, key, targetModel, req, safeChunkHandler)
+		} else {
+			targetModel := strings.TrimPrefix(rawModel, "google/")
+			resp, err = p.chatREST(ctx, key, targetModel, req, safeChunkHandler)
+		}
+
+		// Check if attempt succeeded
+		if err == nil && resp != nil {
+			if resp.Content != "" || len(resp.ToolCalls) > 0 {
+				return resp, nil
+			}
+			err = fmt.Errorf("empty response received from Gemini (0 content, 0 tool calls)")
+		}
+
+		lastErr = err
+
+		// If chunks have already been emitted to the client, we cannot safely replay without duplication
+		if chunksYielded > 0 {
+			log.Printf("[WARN][CHAT] Error occurred after streaming chunks yielded (%d chunks): %v", chunksYielded, err)
+			return resp, err
+		}
+
+		// Check if we should retry
+		if attempt < maxRetries-1 && p.isRetryableError(err) {
+			backoff := time.Duration(1<<attempt) * 500 * time.Millisecond
+			if strings.Contains(strings.ToLower(err.Error()), "429") ||
+				strings.Contains(strings.ToLower(err.Error()), "resource_exhausted") ||
+				strings.Contains(strings.ToLower(err.Error()), "quota") {
+				backoff = time.Duration(attempt+1) * 1000 * time.Millisecond
+			}
+
+			log.Printf("[RETRY] Attempt %d/%d failed: %v. Retrying in %v...", attempt+1, maxRetries, err, backoff)
+
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			continue
+		}
+
+		// Not retryable or max attempts reached
+		break
 	}
 
-	targetModel := strings.TrimPrefix(rawModel, "google/")
-	return p.chatREST(ctx, key, targetModel, req, onChunk)
+	return nil, lastErr
 }
 
 // --- Google REST API Implementation ---
@@ -241,11 +437,17 @@ type geminiTool struct {
 	FunctionDeclarations []geminiFunction `json:"functionDeclarations,omitempty"`
 }
 
+type geminiSafetySetting struct {
+	Category  string `json:"category"`
+	Threshold string `json:"threshold"`
+}
+
 type geminiRequest struct {
 	SystemInstruction *geminiContent          `json:"systemInstruction,omitempty"`
 	Contents          []geminiContent         `json:"contents"`
 	Tools             []geminiTool            `json:"tools,omitempty"`
 	GenerationConfig  *geminiGenerationConfig `json:"generationConfig,omitempty"`
+	SafetySettings    []geminiSafetySetting  `json:"safetySettings,omitempty"`
 }
 
 type geminiResponse struct {
@@ -259,43 +461,39 @@ type geminiResponse struct {
 	} `json:"candidates"`
 }
 
-// maxToolResultChars caps tool call results at approx 4k tokens (~4 characters per token)
-const maxToolResultChars = 16000
+var (
+	thoughtSignaturesLock sync.RWMutex
+	thoughtSignatures     = make(map[string]string)
+)
 
-func truncateMiddle(s string, maxChars int) string {
-	if len(s) <= maxChars || maxChars < 100 {
-		return s
+func cacheThoughtSignature(id string, name string, sig string) {
+	if sig == "" {
+		return
 	}
-	keep := maxChars - 80
-	if keep <= 0 {
-		return s[:maxChars]
+	thoughtSignaturesLock.Lock()
+	defer thoughtSignaturesLock.Unlock()
+	if id != "" {
+		thoughtSignatures[id] = sig
 	}
-	half := keep / 2
-
-	for half > 0 && !utf8.RuneStart(s[half]) {
-		half--
+	if name != "" {
+		thoughtSignatures[name] = sig
 	}
-	endStart := len(s) - half
-	for endStart < len(s) && !utf8.RuneStart(s[endStart]) {
-		endStart++
-	}
-
-	omitted := endStart - half
-	marker := fmt.Sprintf("\n\n... [middle truncated: %d chars / ~%d tokens omitted] ...\n\n", omitted, omitted/4)
-	return s[:half] + marker + s[endStart:]
 }
 
-func truncateMapStrings(m map[string]any, maxChars int) map[string]any {
-	result := make(map[string]any, len(m))
-	for k, v := range m {
-		switch str := v.(type) {
-		case string:
-			result[k] = truncateMiddle(str, maxChars)
-		default:
-			result[k] = v
+func getThoughtSignature(id string, name string) string {
+	thoughtSignaturesLock.RLock()
+	defer thoughtSignaturesLock.RUnlock()
+	if id != "" {
+		if sig, ok := thoughtSignatures[id]; ok {
+			return sig
 		}
 	}
-	return result
+	if name != "" {
+		if sig, ok := thoughtSignatures[name]; ok {
+			return sig
+		}
+	}
+	return ""
 }
 
 func (p *GoogleProvider) buildGeminiContents(messages []Message, isLive bool) ([]geminiContent, []string) {
@@ -320,37 +518,57 @@ func (p *GoogleProvider) buildGeminiContents(messages []Message, isLive bool) ([
 		case "assistant":
 			role = "model"
 		case "tool":
-			if isLive {
-				role = "user"
-			} else {
-				role = "function"
-			}
+			role = "user"
 		default:
 			role = "user"
 		}
 
 		var parts []geminiPart
 
-		for _, tc := range msg.ToolCalls {
-			var args map[string]any
-			if tc.Function.Arguments != "" {
-				if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+		if isLive && len(msg.ToolCalls) > 0 {
+			var bulkCalls []map[string]any
+			for _, tc := range msg.ToolCalls {
+				var args any
+				if tc.Function.Arguments != "" {
+					var parsed map[string]any
+					if err := json.Unmarshal([]byte(tc.Function.Arguments), &parsed); err == nil {
+						args = parsed
+					} else {
+						args = tc.Function.Arguments
+					}
+				} else {
+					args = map[string]any{}
+				}
+				bulkCalls = append(bulkCalls, map[string]any{
+					"name":      tc.Function.Name,
+					"arguments": args,
+				})
+			}
+			bulkJSON, _ := json.Marshal(bulkCalls)
+			parts = append(parts, geminiPart{
+				Text: fmt.Sprintf("<tool_calls>\n%s\n</tool_calls>", string(bulkJSON)),
+			})
+		} else {
+			for _, tc := range msg.ToolCalls {
+				var args map[string]any
+				if tc.Function.Arguments != "" {
+					if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+						args = make(map[string]any)
+					}
+				} else {
 					args = make(map[string]any)
 				}
-			} else {
-				args = make(map[string]any)
-			}
-			if isLive {
-				parts = append(parts, geminiPart{
-					Text: fmt.Sprintf("[Called Tool: %s with arguments: %s]", tc.Function.Name, tc.Function.Arguments),
-				})
-			} else {
+				sig := tc.ThoughtSignature
+				if sig == "" {
+					sig = getThoughtSignature(tc.ID, tc.Function.Name)
+				}
 				parts = append(parts, geminiPart{
 					FunctionCall: &geminiFunctionCall{
 						Name: tc.Function.Name,
 						Args: args,
 						ID:   tc.ID,
 					},
+					ThoughtSignature: sig,
 				})
 			}
 		}
@@ -391,16 +609,28 @@ func (p *GoogleProvider) buildGeminiContents(messages []Message, isLive bool) ([
 			switch part.Type {
 			case ContentTypeText:
 				if msg.Role == "tool" || msg.Role == "function" {
-					toolText := truncateMiddle(part.Text, maxToolResultChars)
+					toolText := part.Text
 					if isLive {
-						gp.Text = fmt.Sprintf("[Tool Result for %s]:\n%s", funcName, toolText)
-						log.Printf("[DEBUG][WS -> GEMINI] History Tool Result as text | Tool: %s, ID: %s", funcName, msg.ToolCallID)
+						var parsedResp any = toolText
+						var jsonResult any
+						if err := json.Unmarshal([]byte(toolText), &jsonResult); err == nil {
+							parsedResp = jsonResult
+						}
+						respArray := []map[string]any{
+							{
+								"name":     funcName,
+								"response": parsedResp,
+							},
+						}
+						b, _ := json.Marshal(respArray)
+						gp.Text = fmt.Sprintf("<tool_responses>\n%s\n</tool_responses>", string(b))
+						log.Printf("[DEBUG][WS -> GEMINI] History Tool Result as standardized JSON | Tool: %s, ID: %s", funcName, msg.ToolCallID)
 					} else {
 						respMap := map[string]any{"result": toolText}
 						var jsonResult any
 						if err := json.Unmarshal([]byte(part.Text), &jsonResult); err == nil {
 							if m, ok := jsonResult.(map[string]any); ok {
-								respMap = truncateMapStrings(m, maxToolResultChars)
+								respMap = m
 							} else {
 								respMap = map[string]any{"result": jsonResult}
 							}
@@ -413,7 +643,7 @@ func (p *GoogleProvider) buildGeminiContents(messages []Message, isLive bool) ([
 						respJSON, _ := json.Marshal(respMap)
 						respPreview := string(respJSON)
 						if len(respPreview) > 300 {
-							respPreview = respPreview[:300] + fmt.Sprintf("... [truncated %d chars]", len(respPreview)-300)
+							respPreview = respPreview[:300] + "..."
 						}
 						log.Printf("[DEBUG][REST -> GEMINI] Function Response | Tool: %s, ID: %s, Response: %s", funcName, msg.ToolCallID, respPreview)
 					}
@@ -442,7 +672,7 @@ func (p *GoogleProvider) buildGeminiContents(messages []Message, isLive bool) ([
 			continue
 		}
 
-		if isLive && len(contents) > 0 && contents[len(contents)-1].Role == role {
+		if len(contents) > 0 && contents[len(contents)-1].Role == role {
 			contents[len(contents)-1].Parts = append(contents[len(contents)-1].Parts, parts...)
 		} else {
 			contents = append(contents, geminiContent{
@@ -463,6 +693,13 @@ func (p *GoogleProvider) chatREST(ctx context.Context, key string, model string,
 
 	gemReq := geminiRequest{
 		Contents: contents,
+		SafetySettings: []geminiSafetySetting{
+			{Category: "HARM_CATEGORY_HARASSMENT", Threshold: "BLOCK_NONE"},
+			{Category: "HARM_CATEGORY_HATE_SPEECH", Threshold: "BLOCK_NONE"},
+			{Category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", Threshold: "BLOCK_NONE"},
+			{Category: "HARM_CATEGORY_DANGEROUS_CONTENT", Threshold: "BLOCK_NONE"},
+			{Category: "HARM_CATEGORY_CIVIC_INTEGRITY", Threshold: "BLOCK_NONE"},
+		},
 	}
 
 	if len(systemInstructions) > 0 {
@@ -573,115 +810,24 @@ func (p *GoogleProvider) chatREST(ctx context.Context, key string, model string,
 							inThought = false
 						}
 
-						combinedText := pendingText + textToYield
-						tags := []string{"<tool_code>", "<tool_call>", "<toolUse>", "<tool_use>", "<function_calls>", "```json", "call:"}
-						foundTag := false
-						tagIndex := -1
-
-						for _, tag := range tags {
-							if idx := strings.Index(combinedText, tag); idx != -1 {
-								foundTag = true
-								if tagIndex == -1 || idx < tagIndex {
-									tagIndex = idx
-								}
-							}
-						}
-
-						if foundTag {
-							toYield := combinedText[:tagIndex]
-							if toYield != "" {
-								fullContent += toYield
+						pendingText = p.processTextStream(
+							pendingText,
+							textToYield,
+							req.Tools,
+							func(tc ToolCall) {
+								log.Printf("[DEBUG][GEMINI -> PROXY] REST Parsed Text Tool Call | Func: %s, ID: %s, Args: %s", tc.Function.Name, tc.ID, tc.Function.Arguments)
+								allToolCalls = append(allToolCalls, tc)
 								if onChunk != nil {
-									onChunk(&CompletionResponse{Content: toYield})
+									onChunk(&CompletionResponse{ToolCalls: []ToolCall{tc}})
 								}
-							}
-							pendingText = combinedText[tagIndex:]
-
-							closers := map[string]string{
-								"<tool_code>":      "</tool_code>",
-								"<tool_call>":      "</tool_call>",
-								"<toolUse>":        "</toolUse>",
-								"<tool_use>":       "</tool_use>",
-								"<function_calls>": "</function_calls>",
-								"```json":          "```",
-								"call:":            "}",
-							}
-
-							for opener, closer := range closers {
-								if strings.HasPrefix(pendingText, opener) {
-									if cIdx := strings.Index(pendingText[len(opener):], closer); cIdx != -1 {
-										endIdx := len(opener) + cIdx + len(closer)
-										rawArgs := pendingText[len(opener) : len(opener)+cIdx]
-										rawArgs = strings.TrimSpace(rawArgs)
-
-										var toolItems []map[string]any
-										if err := json.Unmarshal([]byte(rawArgs), &toolItems); err != nil {
-											var singleItem map[string]any
-											fixArgs := rawArgs
-											keyFixer := regexp.MustCompile(`([{,])\s*([a-zA-Z0-9_]+)\s*:`)
-											fixArgs = keyFixer.ReplaceAllString(fixArgs, `$1"$2":`)
-											if err := json.Unmarshal([]byte(fixArgs), &singleItem); err == nil {
-												toolItems = append(toolItems, singleItem)
-											}
-										}
-
-										for _, item := range toolItems {
-											funcName := opener
-											if opener == "call:" {
-												re := regexp.MustCompile(`^([a-zA-Z0-9_]+)\s*\{`)
-												if m := re.FindStringSubmatch(rawArgs); len(m) >= 2 {
-													funcName = m[1]
-												}
-											} else {
-												if n, ok := item["name"].(string); ok {
-													funcName = n
-												} else if t, ok := item["tool"].(string); ok {
-													funcName = t
-												}
-											}
-
-											prefixes := []string{"tool_use:", "tool_code:", "tool_call:", "call:"}
-											for _, pfx := range prefixes {
-												funcName = strings.TrimPrefix(funcName, pfx)
-											}
-											funcName = strings.ReplaceAll(funcName, " ", "_")
-											args := item
-											if a, ok := item["arguments"].(map[string]any); ok {
-												args = a
-											} else if a, ok := item["args"].(map[string]any); ok {
-												args = a
-											}
-
-											rawArgsBytes, _ := json.Marshal(args)
-											fixedArgs, _ := p.fixToolCall(funcName, args, req.Tools)
-											argsBytes, _ := json.Marshal(fixedArgs)
-
-											toolCall := ToolCall{
-												ID:   fmt.Sprintf("call_stream_%d", len(allToolCalls)),
-												Type: "function",
-												Function: FunctionCall{
-													Name:      funcName,
-													Arguments: string(argsBytes),
-												},
-											}
-											log.Printf("[DEBUG][GEMINI -> PROXY] REST Parsed Text Tool Call | Func: %s, ID: %s, RawArgs: %s, FixedArgs: %s", funcName, toolCall.ID, string(rawArgsBytes), string(argsBytes))
-											allToolCalls = append(allToolCalls, toolCall)
-											if onChunk != nil {
-												onChunk(&CompletionResponse{ToolCalls: []ToolCall{toolCall}})
-											}
-										}
-										pendingText = pendingText[endIdx:]
-									}
-									break
+							},
+							func(text string) {
+								fullContent += text
+								if onChunk != nil {
+									onChunk(&CompletionResponse{Content: text})
 								}
-							}
-						} else {
-							fullContent += combinedText
-							if onChunk != nil {
-								onChunk(&CompletionResponse{Content: combinedText})
-							}
-							pendingText = ""
-						}
+							},
+						)
 					}
 				}
 
@@ -709,7 +855,8 @@ func (p *GoogleProvider) chatREST(ctx context.Context, key string, model string,
 					if tcID == "" {
 						tcID = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), len(allToolCalls))
 					}
-					log.Printf("[DEBUG][GEMINI -> PROXY] REST Tool Call | Func: %s, ID: %s, RawArgs: %s, FixedArgs: %s", funcName, tcID, string(rawArgsBytes), string(argsBytes))
+					cacheThoughtSignature(tcID, funcName, part.ThoughtSignature)
+					log.Printf("[DEBUG][GEMINI -> PROXY] REST Tool Call | Func: %s, ID: %s, RawArgs: %s, FixedArgs: %s (sig len: %d)", funcName, tcID, string(rawArgsBytes), string(argsBytes), len(part.ThoughtSignature))
 					toolCall := ToolCall{
 						ID:   tcID,
 						Type: "function",
@@ -717,6 +864,7 @@ func (p *GoogleProvider) chatREST(ctx context.Context, key string, model string,
 							Name:      funcName,
 							Arguments: string(argsBytes),
 						},
+						ThoughtSignature: part.ThoughtSignature,
 					}
 					allToolCalls = append(allToolCalls, toolCall)
 					if onChunk != nil {
@@ -773,6 +921,23 @@ func (p *GoogleProvider) chatREST(ctx context.Context, key string, model string,
 			onChunk(&CompletionResponse{Content: closing})
 		}
 	}
+	p.flushTextStream(
+		pendingText,
+		req.Tools,
+		func(tc ToolCall) {
+			log.Printf("[DEBUG][GEMINI -> PROXY] REST Flushed Text Tool Call | Func: %s, ID: %s, Args: %s", tc.Function.Name, tc.ID, tc.Function.Arguments)
+			allToolCalls = append(allToolCalls, tc)
+			if onChunk != nil {
+				onChunk(&CompletionResponse{ToolCalls: []ToolCall{tc}})
+			}
+		},
+		func(text string) {
+			fullContent += text
+			if onChunk != nil {
+				onChunk(&CompletionResponse{Content: text})
+			}
+		},
+	)
 
 	return &CompletionResponse{Content: fullContent, ToolCalls: allToolCalls}, nil
 }
@@ -870,6 +1035,318 @@ func (p *GoogleProvider) fixToolCall(funcName string, args map[string]any, avail
 	}
 
 	return args, nil
+}
+
+type toolTagPattern struct {
+	opener string
+	closer string
+}
+
+var knownToolPatterns = []toolTagPattern{
+	{"<tool_calls>", "</tool_calls>"},
+	{"<tool_call>", "</tool_call>"},
+	{"<tool_code>", "</tool_code>"},
+	{"<toolUse>", "</toolUse>"},
+	{"<tool_use>", "</tool_use>"},
+	{"<function_calls>", "</function_calls>"},
+	{"[Called Tool:", "]"},
+	{"call:", "}"},
+	{"```json", "```"},
+}
+
+func cleanJSONString(s string) string {
+	s = strings.TrimSpace(s)
+	keyFixer := regexp.MustCompile(`([{,])\s*([a-zA-Z0-9_]+)\s*:`)
+	s = keyFixer.ReplaceAllString(s, `$1"$2":`)
+	quoteFixer := regexp.MustCompile(`'([^']*)'`)
+	s = quoteFixer.ReplaceAllString(s, `"$1"`)
+	return s
+}
+
+func cleanFunctionName(name string) string {
+	name = strings.TrimSpace(name)
+	prefixes := []string{"tool_use:", "tool_code:", "tool_call:", "call:"}
+	for _, pfx := range prefixes {
+		name = strings.TrimPrefix(name, pfx)
+	}
+	return strings.ReplaceAll(name, " ", "_")
+}
+
+func (p *GoogleProvider) parseToolCallsFromPayload(opener string, raw string, availableTools []Tool) []ToolCall {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+
+	var result []ToolCall
+
+	if opener == "[Called Tool:" {
+		lower := strings.ToLower(raw)
+		var funcName, argsStr string
+		if idx := strings.Index(lower, "with arguments:"); idx != -1 {
+			funcName = strings.TrimSpace(raw[:idx])
+			argsStr = strings.TrimSpace(raw[idx+len("with arguments:"):])
+		} else if idx := strings.Index(raw, "("); idx != -1 && strings.HasSuffix(raw, ")") {
+			funcName = strings.TrimSpace(raw[:idx])
+			argsStr = strings.TrimSpace(raw[idx+1 : len(raw)-1])
+		} else if idx := strings.Index(raw, "{"); idx != -1 {
+			funcName = strings.TrimSpace(raw[:idx])
+			argsStr = strings.TrimSpace(raw[idx:])
+		} else {
+			funcName = raw
+			argsStr = "{}"
+		}
+
+		funcName = cleanFunctionName(funcName)
+		if funcName == "" {
+			return nil
+		}
+
+		var argsMap map[string]any
+		if err := json.Unmarshal([]byte(argsStr), &argsMap); err != nil {
+			cleaned := cleanJSONString(argsStr)
+			_ = json.Unmarshal([]byte(cleaned), &argsMap)
+		}
+		if argsMap == nil {
+			argsMap = make(map[string]any)
+		}
+		fixedArgs, _ := p.fixToolCall(funcName, argsMap, availableTools)
+		fixedBytes, _ := json.Marshal(fixedArgs)
+		result = append(result, ToolCall{
+			ID:   fmt.Sprintf("call_ws_text_%d", time.Now().UnixNano()),
+			Type: "function",
+			Function: FunctionCall{
+				Name:      funcName,
+				Arguments: string(fixedBytes),
+			},
+		})
+		return result
+	}
+
+	if opener == "call:" {
+		re := regexp.MustCompile(`^([a-zA-Z0-9_\-]+)\s*(\{.*)`)
+		if m := re.FindStringSubmatch(raw); len(m) >= 3 {
+			funcName := cleanFunctionName(m[1])
+			argsStr := m[2]
+			var argsMap map[string]any
+			if err := json.Unmarshal([]byte(argsStr), &argsMap); err != nil {
+				cleaned := cleanJSONString(argsStr)
+				_ = json.Unmarshal([]byte(cleaned), &argsMap)
+			}
+			if argsMap == nil {
+				argsMap = make(map[string]any)
+			}
+			fixedArgs, _ := p.fixToolCall(funcName, argsMap, availableTools)
+			fixedBytes, _ := json.Marshal(fixedArgs)
+			result = append(result, ToolCall{
+				ID:   fmt.Sprintf("call_ws_text_%d", time.Now().UnixNano()),
+				Type: "function",
+				Function: FunctionCall{
+					Name:      funcName,
+					Arguments: string(fixedBytes),
+				},
+			})
+		}
+		return result
+	}
+
+	var items []map[string]any
+	if err := json.Unmarshal([]byte(raw), &items); err != nil {
+		var single map[string]any
+		if err2 := json.Unmarshal([]byte(raw), &single); err2 == nil {
+			items = append(items, single)
+		} else {
+			cleaned := cleanJSONString(raw)
+			if err3 := json.Unmarshal([]byte(cleaned), &items); err3 != nil {
+				if err4 := json.Unmarshal([]byte(cleaned), &single); err4 == nil {
+					items = append(items, single)
+				}
+			}
+		}
+	}
+
+	for i, item := range items {
+		funcName := ""
+		if n, ok := item["name"].(string); ok {
+			funcName = n
+		} else if t, ok := item["tool"].(string); ok {
+			funcName = t
+		} else if f, ok := item["function"].(string); ok {
+			funcName = f
+		}
+		funcName = cleanFunctionName(funcName)
+		if funcName == "" {
+			continue
+		}
+
+		var args map[string]any
+		if a, ok := item["arguments"].(map[string]any); ok {
+			args = a
+		} else if a, ok := item["args"].(map[string]any); ok {
+			args = a
+		} else if a, ok := item["parameters"].(map[string]any); ok {
+			args = a
+		} else if aStr, ok := item["arguments"].(string); ok {
+			_ = json.Unmarshal([]byte(aStr), &args)
+		} else {
+			args = make(map[string]any)
+			for k, v := range item {
+				if k != "name" && k != "tool" && k != "function" {
+					args[k] = v
+				}
+			}
+		}
+		if args == nil {
+			args = make(map[string]any)
+		}
+		fixedArgs, _ := p.fixToolCall(funcName, args, availableTools)
+		fixedBytes, _ := json.Marshal(fixedArgs)
+		result = append(result, ToolCall{
+			ID:   fmt.Sprintf("call_ws_text_%d_%d", time.Now().UnixNano(), i),
+			Type: "function",
+			Function: FunctionCall{
+				Name:      funcName,
+				Arguments: string(fixedBytes),
+			},
+		})
+	}
+
+	return result
+}
+
+func (p *GoogleProvider) parseUnclosedToolCalls(text string, availableTools []Tool) []ToolCall {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+
+	patterns := []string{
+		"<tool_calls>",
+		"<tool_call>",
+		"<tool_code>",
+		"<toolUse>",
+		"<tool_use>",
+		"<function_calls>",
+		"[Called Tool:",
+	}
+
+	for _, opener := range patterns {
+		if idx := strings.Index(text, opener); idx != -1 {
+			payload := text[idx+len(opener):]
+			closer := ""
+			for _, pat := range knownToolPatterns {
+				if pat.opener == opener {
+					closer = pat.closer
+					break
+				}
+			}
+			if closer != "" {
+				payload = strings.TrimSuffix(strings.TrimSpace(payload), closer)
+			}
+			tcs := p.parseToolCallsFromPayload(opener, payload, availableTools)
+			if len(tcs) > 0 {
+				return tcs
+			}
+		}
+	}
+	return nil
+}
+
+func (p *GoogleProvider) processTextStream(
+	pendingText string,
+	incomingText string,
+	availableTools []Tool,
+	onToolCall func(ToolCall),
+	onContent func(string),
+) string {
+	combined := pendingText + incomingText
+
+	for len(combined) > 0 {
+		bestOpenerIdx := -1
+		var matchedPattern toolTagPattern
+
+		for _, pat := range knownToolPatterns {
+			idx := strings.Index(combined, pat.opener)
+			if idx != -1 && (bestOpenerIdx == -1 || idx < bestOpenerIdx) {
+				bestOpenerIdx = idx
+				matchedPattern = pat
+			}
+		}
+
+		if bestOpenerIdx == -1 {
+			partialLen := 0
+			for _, pat := range knownToolPatterns {
+				for l := len(pat.opener) - 1; l >= 2; l-- {
+					if strings.HasSuffix(combined, pat.opener[:l]) {
+						if l > partialLen {
+							partialLen = l
+						}
+					}
+				}
+			}
+			if partialLen > 0 {
+				safeToYield := combined[:len(combined)-partialLen]
+				if safeToYield != "" && onContent != nil {
+					onContent(safeToYield)
+				}
+				return combined[len(combined)-partialLen:]
+			}
+			if combined != "" && onContent != nil {
+				onContent(combined)
+			}
+			return ""
+		}
+
+		if bestOpenerIdx > 0 {
+			pre := combined[:bestOpenerIdx]
+			if onContent != nil {
+				onContent(pre)
+			}
+		}
+
+		searchStart := bestOpenerIdx + len(matchedPattern.opener)
+		closerIdx := strings.Index(combined[searchStart:], matchedPattern.closer)
+		if closerIdx == -1 {
+			return combined[bestOpenerIdx:]
+		}
+
+		rawPayload := combined[searchStart : searchStart+closerIdx]
+		blockEnd := searchStart + closerIdx + len(matchedPattern.closer)
+
+		tcs := p.parseToolCallsFromPayload(matchedPattern.opener, rawPayload, availableTools)
+		for _, tc := range tcs {
+			if onToolCall != nil {
+				onToolCall(tc)
+			}
+		}
+
+		combined = combined[blockEnd:]
+	}
+
+	return ""
+}
+
+func (p *GoogleProvider) flushTextStream(
+	pendingText string,
+	availableTools []Tool,
+	onToolCall func(ToolCall),
+	onContent func(string),
+) {
+	if pendingText == "" {
+		return
+	}
+	tcs := p.parseUnclosedToolCalls(pendingText, availableTools)
+	if len(tcs) > 0 {
+		for _, tc := range tcs {
+			if onToolCall != nil {
+				onToolCall(tc)
+			}
+		}
+		return
+	}
+	if onContent != nil {
+		onContent(pendingText)
+	}
 }
 
 func sanitizeGeminiSchemaMap(m map[string]any) map[string]any {
@@ -991,6 +1468,7 @@ type liveSetup struct {
 	SystemInstruction        *geminiContent        `json:"systemInstruction,omitempty"`
 	OutputAudioTranscription map[string]any        `json:"outputAudioTranscription,omitempty"`
 	Tools                    []liveTool            `json:"tools,omitempty"`
+	SafetySettings           []geminiSafetySetting `json:"safetySettings,omitempty"`
 }
 
 type liveGenerationConfig struct {
@@ -1022,10 +1500,11 @@ type liveIncomingFrame struct {
 	ServerContent *struct {
 		ModelTurn *struct {
 			Parts []struct {
-				Text         string              `json:"text,omitempty"`
-				Thought      bool                `json:"thought,omitempty"`
-				InlineData   *geminiInline       `json:"inlineData,omitempty"`
-				FunctionCall *geminiFunctionCall `json:"functionCall,omitempty"`
+				Text             string              `json:"text,omitempty"`
+				Thought          bool                `json:"thought,omitempty"`
+				ThoughtSignature string              `json:"thoughtSignature,omitempty"`
+				InlineData       *geminiInline       `json:"inlineData,omitempty"`
+				FunctionCall     *geminiFunctionCall `json:"functionCall,omitempty"`
 			} `json:"parts,omitempty"`
 		} `json:"modelTurn,omitempty"`
 		OutputTranscription *struct {
@@ -1069,242 +1548,129 @@ func cleanExpiredLiveConns() {
 	}
 }
 
-func (p *GoogleProvider) chatWebSocket(ctx context.Context, apiKey string, targetModel string, req *CompletionRequest, onChunk func(*CompletionResponse)) (*CompletionResponse, error) {
-	cleanExpiredLiveConns()
-
-	var matchedSession *liveConnSession
-	for _, msg := range req.Messages {
-		if (msg.Role == "tool" || msg.Role == "function") && msg.ToolCallID != "" {
-			liveConnsLock.Lock()
-			if sess, ok := liveConns[msg.ToolCallID]; ok {
-				if time.Now().Before(sess.expiresAt) {
-					matchedSession = sess
-				}
-			}
-			liveConnsLock.Unlock()
-			if matchedSession != nil {
-				break
-			}
-		}
+func (p *GoogleProvider) dialAndSetupLive(ctx context.Context, apiKey string, targetModel string, req *CompletionRequest) (*websocket.Conn, []geminiContent, error) {
+	model := targetModel
+	if model == "" {
+		model = "gemini-3.1-flash-live-preview"
 	}
 
-	var (
-		conn         *websocket.Conn
-		isReused     bool
-		keepConnOpen bool
-	)
-
-	if matchedSession != nil {
-		liveConnsLock.Lock()
-		for id, sess := range liveConns {
-			if sess == matchedSession {
-				delete(liveConns, id)
-			}
-		}
-		liveConnsLock.Unlock()
-
-		var toolResponses []geminiFunctionResponse
-		for i := len(req.Messages) - 1; i >= 0; i-- {
-			msg := req.Messages[i]
-			if msg.Role != "tool" && msg.Role != "function" {
-				break
-			}
-			funcName := msg.Name
-			if funcName == "" && msg.ToolCallID != "" {
-				for j := i - 1; j >= 0; j-- {
-					for _, tc := range req.Messages[j].ToolCalls {
-						if tc.ID == msg.ToolCallID {
-							funcName = tc.Function.Name
-							break
-						}
-					}
-					if funcName != "" {
-						break
-					}
-				}
-			}
-			if funcName == "" {
-				for j := i - 1; j >= 0; j-- {
-					if len(req.Messages[j].ToolCalls) > 0 {
-						funcName = req.Messages[j].ToolCalls[0].Function.Name
-						break
-					}
-				}
-			}
-			for _, pfx := range []string{"tool_use:", "tool_code:", "tool_call:", "call:"} {
-				funcName = strings.TrimPrefix(funcName, pfx)
-			}
-			if funcName == "" {
-				funcName = "unknown"
-			}
-
-			toolText := ""
-			for _, part := range msg.Content {
-				if part.Type == ContentTypeText && part.Text != "" {
-					toolText += part.Text
-				}
-			}
-			toolText = truncateMiddle(toolText, maxToolResultChars)
-
-			respMap := map[string]any{"result": toolText}
-			var jsonResult any
-			if err := json.Unmarshal([]byte(toolText), &jsonResult); err == nil {
-				if m, ok := jsonResult.(map[string]any); ok {
-					respMap = truncateMapStrings(m, maxToolResultChars)
-				} else {
-					respMap = map[string]any{"result": jsonResult}
-				}
-			}
-
-			toolResponses = append([]geminiFunctionResponse{
-				{
-					Name:     funcName,
-					Response: respMap,
-					ID:       msg.ToolCallID,
-				},
-			}, toolResponses...)
-		}
-
-		if len(toolResponses) > 0 {
-			toolRespMsg := map[string]any{
-				"toolResponse": map[string]any{
-					"functionResponses": toolResponses,
-				},
-			}
-			toolRespJSON, err := json.Marshal(toolRespMsg)
-			if err == nil {
-				log.Printf("[DEBUG][WS -> GEMINI] Reusing connection for %d tool response(s)...", len(toolResponses))
-				if err := matchedSession.conn.WriteMessage(websocket.TextMessage, toolRespJSON); err == nil {
-					conn = matchedSession.conn
-					isReused = true
-				} else {
-					log.Printf("[WARN][WS] Failed to write toolResponse to cached connection (%v), falling back to new connection", err)
-					matchedSession.conn.Close()
-				}
-			}
-		}
+	modelLower := strings.ToLower(model)
+	var thinkingLevel string
+	if strings.Contains(modelLower, "extended-thinking") || strings.Contains(modelLower, "high") {
+		thinkingLevel = "HIGH"
+	} else if strings.Contains(modelLower, "low") {
+		thinkingLevel = "LOW"
+	} else if strings.Contains(modelLower, "minimal") {
+		thinkingLevel = "MINIMAL"
+	} else if strings.Contains(modelLower, "medium") {
+		thinkingLevel = "MEDIUM"
+	} else if strings.Contains(modelLower, "3.8") {
+		thinkingLevel = "LOW"
+	} else {
+		thinkingLevel = "HIGH"
 	}
 
-	var contents []geminiContent
-	if !isReused {
-		model := targetModel
-		if model == "" {
-			model = "gemini-3.1-flash-live-preview"
-		}
+	if req.Thinking != nil && req.Thinking.ThinkingLevel != "" {
+		thinkingLevel = strings.ToUpper(string(req.Thinking.ThinkingLevel))
+	}
 
-		modelLower := strings.ToLower(model)
-		var thinkingLevel string
-		if strings.Contains(modelLower, "extended-thinking") || strings.Contains(modelLower, "high") {
-			thinkingLevel = "HIGH"
-		} else if strings.Contains(modelLower, "low") {
-			thinkingLevel = "LOW"
-		} else if strings.Contains(modelLower, "minimal") {
-			thinkingLevel = "MINIMAL"
-		} else if strings.Contains(modelLower, "medium") {
-			thinkingLevel = "MEDIUM"
-		} else if strings.Contains(modelLower, "3.8") {
-			thinkingLevel = "LOW"
-		} else {
-			thinkingLevel = "HIGH"
-		}
+	if !strings.HasPrefix(model, "models/") {
+		model = "models/" + model
+	}
 
-		if req.Thinking != nil && req.Thinking.ThinkingLevel != "" {
-			thinkingLevel = strings.ToUpper(string(req.Thinking.ThinkingLevel))
-		}
+	wsURL := p.WSURL
+	if wsURL == "" {
+		wsURL = fmt.Sprintf("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=%s", url.QueryEscape(apiKey))
+	}
 
-		if !strings.HasPrefix(model, "models/") {
-			model = "models/" + model
+	dialer := websocket.DefaultDialer
+	conn, resp, err := dialer.DialContext(ctx, wsURL, nil)
+	if err != nil {
+		if resp != nil {
+			return nil, nil, fmt.Errorf("google live ws dial failed with status %d: %w", resp.StatusCode, err)
 		}
+		return nil, nil, fmt.Errorf("google live ws dial failed: %w", err)
+	}
 
-		wsURL := p.WSURL
-		if wsURL == "" {
-			wsURL = fmt.Sprintf("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=%s", url.QueryEscape(apiKey))
-		}
+	var systemInstructions []string
+	contents, systemInstructions := p.buildGeminiContents(req.Messages, true)
+	if req.SystemInstruction != "" {
+		systemInstructions = append([]string{req.SystemInstruction}, systemInstructions...)
+	}
 
-		dialer := websocket.DefaultDialer
-		newConn, resp, err := dialer.DialContext(ctx, wsURL, nil)
-		if err != nil {
-			if resp != nil {
-				return nil, fmt.Errorf("google live ws dial failed with status %d: %w", resp.StatusCode, err)
-			}
-			return nil, fmt.Errorf("google live ws dial failed: %w", err)
-		}
-		conn = newConn
+	modalities := p.ResponseModalities
+	if len(modalities) == 0 {
+		modalities = []string{"AUDIO"}
+	}
 
-		var systemInstructions []string
-		contents, systemInstructions = p.buildGeminiContents(req.Messages, true)
-		if req.SystemInstruction != "" {
-			systemInstructions = append([]string{req.SystemInstruction}, systemInstructions...)
-		}
-
-		modalities := p.ResponseModalities
-		if len(modalities) == 0 {
-			modalities = []string{"AUDIO"}
-		}
-
-		setupMsg := liveSetupMessage{
-			Setup: liveSetup{
-				Model: model,
-				GenerationConfig: &liveGenerationConfig{
-					ResponseModalities: modalities,
-					ThinkingConfig: &liveThinking{
-						IncludeThoughts: true,
-						ThinkingLevel:   thinkingLevel,
-					},
+	setupMsg := liveSetupMessage{
+		Setup: liveSetup{
+			Model: model,
+			GenerationConfig: &liveGenerationConfig{
+				ResponseModalities: modalities,
+				ThinkingConfig: &liveThinking{
+					IncludeThoughts: true,
+					ThinkingLevel:   thinkingLevel,
 				},
-				OutputAudioTranscription: map[string]any{},
 			},
-		}
+			OutputAudioTranscription: map[string]any{},
+			SafetySettings: []geminiSafetySetting{
+				{Category: "HARM_CATEGORY_HARASSMENT", Threshold: "BLOCK_NONE"},
+				{Category: "HARM_CATEGORY_HATE_SPEECH", Threshold: "BLOCK_NONE"},
+				{Category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", Threshold: "BLOCK_NONE"},
+				{Category: "HARM_CATEGORY_DANGEROUS_CONTENT", Threshold: "BLOCK_NONE"},
+				{Category: "HARM_CATEGORY_CIVIC_INTEGRITY", Threshold: "BLOCK_NONE"},
+			},
+		},
+	}
 
-		if len(systemInstructions) > 0 {
-			setupMsg.Setup.SystemInstruction = &geminiContent{
-				Parts: []geminiPart{{Text: strings.Join(systemInstructions, "\n\n")}},
-			}
-		}
-
-		if len(req.Tools) > 0 {
-			var funcDecls []geminiFunction
-			for _, tool := range req.Tools {
-				for _, fn := range tool.Functions {
-					funcDecls = append(funcDecls, geminiFunction{
-						Name:        fn.Name,
-						Description: fn.Description,
-						Parameters:  sanitizeGeminiSchemaMap(fn.Parameters),
-					})
-				}
-				if tool.Name != "" && len(tool.Functions) == 0 {
-					funcDecls = append(funcDecls, geminiFunction{
-						Name:        tool.Name,
-						Description: tool.Description,
-						Parameters:  sanitizeGeminiSchemaMap(tool.Parameters),
-					})
-				}
-			}
-			if len(funcDecls) > 0 {
-				setupMsg.Setup.Tools = []liveTool{{FunctionDeclarations: funcDecls}}
-			}
-		}
-
-		setupJSON, err := json.Marshal(setupMsg)
-		if err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("failed to marshal setup frame: %w", err)
-		}
-
-		if err := conn.WriteMessage(websocket.TextMessage, setupJSON); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("failed to send setup frame: %w", err)
+	if len(systemInstructions) > 0 {
+		setupMsg.Setup.SystemInstruction = &geminiContent{
+			Parts: []geminiPart{{Text: strings.Join(systemInstructions, "\n\n")}},
 		}
 	}
 
-	defer func() {
-		if !keepConnOpen && conn != nil {
-			conn.Close()
+	if len(req.Tools) > 0 {
+		var funcDecls []geminiFunction
+		for _, tool := range req.Tools {
+			for _, fn := range tool.Functions {
+				funcDecls = append(funcDecls, geminiFunction{
+					Name:        fn.Name,
+					Description: fn.Description,
+					Parameters:  sanitizeGeminiSchemaMap(fn.Parameters),
+				})
+			}
+			if tool.Name != "" && len(tool.Functions) == 0 {
+				funcDecls = append(funcDecls, geminiFunction{
+					Name:        tool.Name,
+					Description: tool.Description,
+					Parameters:  sanitizeGeminiSchemaMap(tool.Parameters),
+				})
+			}
 		}
-	}()
+		if len(funcDecls) > 0 {
+			setupMsg.Setup.Tools = []liveTool{{FunctionDeclarations: funcDecls}}
+		}
+	}
 
+	setupJSON, err := json.Marshal(setupMsg)
+	if err != nil {
+		conn.Close()
+		return nil, nil, fmt.Errorf("failed to marshal setup frame: %w", err)
+	}
+
+	if err := conn.WriteMessage(websocket.TextMessage, setupJSON); err != nil {
+		conn.Close()
+		return nil, nil, fmt.Errorf("failed to send setup frame: %w", err)
+	}
+
+	return conn, contents, nil
+}
+
+func (p *GoogleProvider) readLiveStream(ctx context.Context, conn *websocket.Conn, contents []geminiContent, req *CompletionRequest, onChunk func(*CompletionResponse)) (*CompletionResponse, bool, error) {
 	var (
 		fullResponse CompletionResponse
+		keepConnOpen bool
 		doneChan     = make(chan struct{})
 		errChan      = make(chan error, 1)
 	)
@@ -1321,10 +1687,17 @@ func (p *GoogleProvider) chatWebSocket(ctx context.Context, apiKey string, targe
 
 	go func() {
 		defer close(doneChan)
+		var pendingText string
 		for {
 			_, msgBytes, err := conn.ReadMessage()
 			if err != nil {
-				if websocket.IsCloseError(err, websocket.CloseNormalClosure) || ctx.Err() != nil {
+				if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+					if fullResponse.Content == "" && len(fullResponse.ToolCalls) == 0 {
+						errChan <- fmt.Errorf("gemini live ws closed with normal closure (1000) without response")
+					}
+					return
+				}
+				if ctx.Err() != nil {
 					return
 				}
 				errChan <- err
@@ -1375,7 +1748,8 @@ func (p *GoogleProvider) chatWebSocket(ctx context.Context, apiKey string, targe
 							if callID == "" {
 								callID = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), len(fullResponse.ToolCalls))
 							}
-							log.Printf("[DEBUG][WS -> PROXY] Live Tool Call (part) | Tool: %s, ID: %s, RawArgs: %s, FixedArgs: %s", funcName, callID, string(rawArgsBytes), string(argsBytes))
+							cacheThoughtSignature(callID, funcName, part.ThoughtSignature)
+							log.Printf("[DEBUG][WS -> PROXY] Live Tool Call (part) | Tool: %s, ID: %s, RawArgs: %s, FixedArgs: %s (sig len: %d)", funcName, callID, string(rawArgsBytes), string(argsBytes), len(part.ThoughtSignature))
 							tc := ToolCall{
 								ID:   callID,
 								Type: "function",
@@ -1383,29 +1757,77 @@ func (p *GoogleProvider) chatWebSocket(ctx context.Context, apiKey string, targe
 									Name:      funcName,
 									Arguments: string(argsBytes),
 								},
+								ThoughtSignature: part.ThoughtSignature,
 							}
 							fullResponse.ToolCalls = append(fullResponse.ToolCalls, tc)
 							if onChunk != nil {
 								onChunk(&CompletionResponse{ToolCalls: []ToolCall{tc}})
 							}
 						} else if part.Text != "" {
-							fullResponse.Content += part.Text
-							if onChunk != nil {
-								onChunk(&CompletionResponse{Content: part.Text})
-							}
+							pendingText = p.processTextStream(
+								pendingText,
+								part.Text,
+								req.Tools,
+								func(tc ToolCall) {
+									log.Printf("[DEBUG][WS -> PROXY] Live Parsed Text Tool Call | Tool: %s, ID: %s, Args: %s", tc.Function.Name, tc.ID, tc.Function.Arguments)
+									fullResponse.ToolCalls = append(fullResponse.ToolCalls, tc)
+									if onChunk != nil {
+										onChunk(&CompletionResponse{ToolCalls: []ToolCall{tc}})
+									}
+								},
+								func(text string) {
+									fullResponse.Content += text
+									if onChunk != nil {
+										onChunk(&CompletionResponse{Content: text})
+									}
+								},
+							)
 						}
 					}
 				}
 
 				if frame.ServerContent.OutputTranscription != nil && frame.ServerContent.OutputTranscription.Text != "" {
 					txt := frame.ServerContent.OutputTranscription.Text
-					fullResponse.Content += txt
-					if onChunk != nil {
-						onChunk(&CompletionResponse{Content: txt})
-					}
+					pendingText = p.processTextStream(
+						pendingText,
+						txt,
+						req.Tools,
+						func(tc ToolCall) {
+							log.Printf("[DEBUG][WS -> PROXY] Live Parsed Transcription Tool Call | Tool: %s, ID: %s, Args: %s", tc.Function.Name, tc.ID, tc.Function.Arguments)
+							fullResponse.ToolCalls = append(fullResponse.ToolCalls, tc)
+							if onChunk != nil {
+								onChunk(&CompletionResponse{ToolCalls: []ToolCall{tc}})
+							}
+						},
+						func(text string) {
+							fullResponse.Content += text
+							if onChunk != nil {
+								onChunk(&CompletionResponse{Content: text})
+							}
+						},
+					)
 				}
 
 				if frame.ServerContent.TurnComplete || frame.ServerContent.GenerationComplete {
+					p.flushTextStream(
+						pendingText,
+						req.Tools,
+						func(tc ToolCall) {
+							log.Printf("[DEBUG][WS -> PROXY] Live Flushed Text Tool Call | Tool: %s, ID: %s, Args: %s", tc.Function.Name, tc.ID, tc.Function.Arguments)
+							fullResponse.ToolCalls = append(fullResponse.ToolCalls, tc)
+							if onChunk != nil {
+								onChunk(&CompletionResponse{ToolCalls: []ToolCall{tc}})
+							}
+						},
+						func(text string) {
+							fullResponse.Content += text
+							if onChunk != nil {
+								onChunk(&CompletionResponse{Content: text})
+							}
+						},
+					)
+					pendingText = ""
+
 					if len(fullResponse.ToolCalls) > 0 {
 						sess := &liveConnSession{
 							conn:      conn,
@@ -1470,10 +1892,160 @@ func (p *GoogleProvider) chatWebSocket(ctx context.Context, apiKey string, targe
 
 	select {
 	case err := <-errChan:
-		return nil, err
+		return nil, false, err
 	case <-doneChan:
-		return &fullResponse, nil
+		return &fullResponse, keepConnOpen, nil
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, false, ctx.Err()
 	}
+}
+
+func (p *GoogleProvider) chatWebSocket(ctx context.Context, apiKey string, targetModel string, req *CompletionRequest, onChunk func(*CompletionResponse)) (*CompletionResponse, error) {
+	cleanExpiredLiveConns()
+
+	var matchedSession *liveConnSession
+	for _, msg := range req.Messages {
+		if (msg.Role == "tool" || msg.Role == "function") && msg.ToolCallID != "" {
+			liveConnsLock.Lock()
+			if sess, ok := liveConns[msg.ToolCallID]; ok {
+				if time.Now().Before(sess.expiresAt) {
+					matchedSession = sess
+				}
+			}
+			liveConnsLock.Unlock()
+			if matchedSession != nil {
+				break
+			}
+		}
+	}
+
+	if matchedSession != nil {
+		liveConnsLock.Lock()
+		for id, sess := range liveConns {
+			if sess == matchedSession {
+				delete(liveConns, id)
+			}
+		}
+		liveConnsLock.Unlock()
+
+		var toolResponses []geminiFunctionResponse
+		for i := len(req.Messages) - 1; i >= 0; i-- {
+			msg := req.Messages[i]
+			if msg.Role != "tool" && msg.Role != "function" {
+				break
+			}
+			funcName := msg.Name
+			if funcName == "" && msg.ToolCallID != "" {
+				for j := i - 1; j >= 0; j-- {
+					for _, tc := range req.Messages[j].ToolCalls {
+						if tc.ID == msg.ToolCallID {
+							funcName = tc.Function.Name
+							break
+						}
+					}
+					if funcName != "" {
+						break
+					}
+				}
+			}
+			if funcName == "" {
+				for j := i - 1; j >= 0; j-- {
+					if len(req.Messages[j].ToolCalls) > 0 {
+						funcName = req.Messages[j].ToolCalls[0].Function.Name
+						break
+					}
+				}
+			}
+			for _, pfx := range []string{"tool_use:", "tool_code:", "tool_call:", "call:"} {
+				funcName = strings.TrimPrefix(funcName, pfx)
+			}
+			if funcName == "" {
+				funcName = "unknown"
+			}
+
+			toolText := ""
+			for _, part := range msg.Content {
+				if part.Type == ContentTypeText && part.Text != "" {
+					toolText += part.Text
+				}
+			}
+
+			respMap := map[string]any{"result": toolText}
+			var jsonResult any
+			if err := json.Unmarshal([]byte(toolText), &jsonResult); err == nil {
+				if m, ok := jsonResult.(map[string]any); ok {
+					respMap = m
+				} else {
+					respMap = map[string]any{"result": jsonResult}
+				}
+			}
+
+			toolResponses = append([]geminiFunctionResponse{
+				{
+					Name:     funcName,
+					Response: respMap,
+					ID:       msg.ToolCallID,
+				},
+			}, toolResponses...)
+		}
+
+		if len(toolResponses) > 0 {
+			toolRespMsg := map[string]any{
+				"toolResponse": map[string]any{
+					"functionResponses": toolResponses,
+				},
+			}
+			toolRespJSON, err := json.Marshal(toolRespMsg)
+			if err == nil {
+				log.Printf("[DEBUG][WS -> GEMINI] Reusing connection for %d tool response(s)...", len(toolResponses))
+				if err := matchedSession.conn.WriteMessage(websocket.TextMessage, toolRespJSON); err == nil {
+					chunksYielded := 0
+					safeOnChunk := func(c *CompletionResponse) {
+						if c != nil && (c.Content != "" || len(c.ToolCalls) > 0 || c.Thought != "") {
+							chunksYielded++
+							if onChunk != nil {
+								onChunk(c)
+							}
+						}
+					}
+
+					resp, keepOpen, readErr := p.readLiveStream(ctx, matchedSession.conn, nil, req, safeOnChunk)
+					if !keepOpen {
+						matchedSession.conn.Close()
+					}
+
+					if readErr == nil && resp != nil && (resp.Content != "" || len(resp.ToolCalls) > 0) {
+						return resp, nil
+					}
+
+					if chunksYielded == 0 && ctx.Err() == nil {
+						log.Printf("[WARN][WS] Reused connection failed or closed without response (%v). Discarding session and falling back to fresh connection...", readErr)
+					} else {
+						return resp, readErr
+					}
+				} else {
+					log.Printf("[WARN][WS] Failed to write toolResponse to cached connection (%v), falling back to fresh connection", err)
+					matchedSession.conn.Close()
+				}
+			}
+		} else {
+			matchedSession.conn.Close()
+		}
+	}
+
+	// Dial fresh connection
+	conn, contents, err := p.dialAndSetupLive(ctx, apiKey, targetModel, req)
+	if err != nil {
+		return nil, err
+	}
+	var keepConnOpen bool
+	defer func() {
+		if !keepConnOpen && conn != nil {
+			conn.Close()
+		}
+	}()
+
+	resp, keepOpen, err := p.readLiveStream(ctx, conn, contents, req, onChunk)
+	keepConnOpen = keepOpen
+	return resp, err
 }

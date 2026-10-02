@@ -13,21 +13,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Neuxbane/Ollama-One/middleware"
 	"github.com/Neuxbane/Ollama-One/providers"
 )
-
-type ConfigEntry struct {
-	Type     string `json:"type"`
-	Provider string `json:"provider"`
-	Key      string `json:"key"`
-}
-
-func (c ConfigEntry) GetType() string {
-	if c.Type != "" {
-		return c.Type
-	}
-	return c.Provider
-}
 
 type loggingResponseWriter struct {
 	http.ResponseWriter
@@ -76,6 +64,7 @@ type OpenAIStreamOptions struct {
 }
 
 type OpenAIChatCompletionRequest struct {
+	APIKey              string               `json:"api_key,omitempty"`
 	Model               string               `json:"model"`
 	Messages            []OpenAIChatMessage  `json:"messages"`
 	Stream              bool                 `json:"stream"`
@@ -97,48 +86,10 @@ var (
 	sessionManager = NewSessionManager()
 )
 
-func loadConfig(path string) ([]ConfigEntry, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var config []ConfigEntry
-	if err := json.Unmarshal(data, &config); err != nil {
-		return nil, err
-	}
-	return config, nil
-}
-
 func main() {
-	config, err := loadConfig("config.json")
-	if err != nil {
-		log.Printf("Warning: could not load config.json: %v", err)
-	}
-
 	var googleKeys []string
 
-	for _, entry := range config {
-		t := strings.ToLower(entry.GetType())
-		switch t {
-		case "google", "gemini", "gemini-live", "live":
-			if entry.Key != "" {
-				googleKeys = append(googleKeys, entry.Key)
-			}
-		default:
-			log.Printf("[CONFIG] Warning: ignored provider type %q in config", entry.GetType())
-		}
-	}
-
-	// Fallback to environment variables
-	if len(googleKeys) == 0 {
-		if envKey := os.Getenv("GEMINI_API_KEY"); envKey != "" {
-			googleKeys = append(googleKeys, envKey)
-		} else if envKey := os.Getenv("GOOGLE_API_KEY"); envKey != "" {
-			googleKeys = append(googleKeys, envKey)
-		}
-	}
-
-	log.Printf("[CONFIG] Loaded %d Google API key(s)", len(googleKeys))
+	log.Println("[CONFIG] Running in strictly stateless mode (provide API key per-request via 'Authorization: Bearer <key>', 'x-api-key', or '?key=<key>')")
 
 	googleProvider = providers.NewGoogleProvider(googleKeys)
 
@@ -241,6 +192,62 @@ func extractOpenAITextContent(content any) string {
 	default:
 		return ""
 	}
+}
+
+func isUsableKey(k string) bool {
+	k = strings.TrimSpace(k)
+	if k == "" {
+		return false
+	}
+	lower := strings.ToLower(k)
+	if lower == "dummy" || lower == "none" || lower == "null" || lower == "ollama" || lower == "test" || lower == "sk-placeholder" {
+		return false
+	}
+	return true
+}
+
+func extractAPIKey(r *http.Request, req *OpenAIChatCompletionRequest) string {
+	// 1. Authorization: Bearer <key>
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+			candidate := strings.TrimSpace(auth[7:])
+			if isUsableKey(candidate) {
+				return candidate
+			}
+		} else if isUsableKey(auth) {
+			return strings.TrimSpace(auth)
+		}
+	}
+
+	// 2. x-api-key header (standard Anthropic / Ollama / API Gateway header)
+	if k := r.Header.Get("x-api-key"); isUsableKey(k) {
+		return strings.TrimSpace(k)
+	}
+
+	// 3. X-Goog-Api-Key header (Google official API key header)
+	if k := r.Header.Get("X-Goog-Api-Key"); isUsableKey(k) {
+		return strings.TrimSpace(k)
+	}
+
+	// 4. api-key header (Azure / generic header)
+	if k := r.Header.Get("api-key"); isUsableKey(k) {
+		return strings.TrimSpace(k)
+	}
+
+	// 5. Query parameters: ?key=... or ?api_key=...
+	if k := r.URL.Query().Get("key"); isUsableKey(k) {
+		return strings.TrimSpace(k)
+	}
+	if k := r.URL.Query().Get("api_key"); isUsableKey(k) {
+		return strings.TrimSpace(k)
+	}
+
+	// 6. JSON body "api_key"
+	if req != nil && isUsableKey(req.APIKey) {
+		return strings.TrimSpace(req.APIKey)
+	}
+
+	return ""
 }
 
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -379,7 +386,17 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	apiKey := extractAPIKey(r, &req)
+	if apiKey != "" {
+		preview := apiKey
+		if len(preview) > 8 {
+			preview = preview[:4] + "..." + preview[len(preview)-4:]
+		}
+		log.Printf("[AUTH] Request authenticated with provided API key (%s)", preview)
+	}
+
 	internalReq := &providers.CompletionRequest{
+		APIKey:   apiKey,
 		Model:    req.Model,
 		Messages: internalMessages,
 		Tools:    internalTools,
@@ -415,6 +432,10 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			internalReq.Messages = session.Messages
 		}
+	}
+
+	if err := middleware.Process(internalReq); err != nil {
+		log.Printf("[MIDDLEWARE] Error applying directives: %v", err)
 	}
 
 	completionID := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
@@ -728,7 +749,8 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	models, err := googleProvider.ListModels(r.Context())
+	apiKey := extractAPIKey(r, nil)
+	models, err := googleProvider.ListModelsWithKey(r.Context(), apiKey)
 	if err != nil {
 		log.Printf("[API] Error listing models: %v", err)
 	}

@@ -36,6 +36,10 @@ func (m *MockProvider) ListModels(ctx context.Context) ([]providers.ModelInfo, e
 	}, nil
 }
 
+func (m *MockProvider) ListModelsWithKey(ctx context.Context, apiKey string) ([]providers.ModelInfo, error) {
+	return m.ListModels(ctx)
+}
+
 func (m *MockProvider) Chat(ctx context.Context, req *providers.CompletionRequest, onChunk func(*providers.CompletionResponse)) (*providers.CompletionResponse, error) {
 	m.LastReq = req
 	if req.Stream && onChunk != nil {
@@ -440,3 +444,107 @@ func TestChatCompletionsMultiTurnToolResult(t *testing.T) {
 		t.Errorf("Unexpected tool message content: %+v", toolMsg.Content)
 	}
 }
+
+func TestExtractAPIKey(t *testing.T) {
+	// 1. Authorization: Bearer
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer AIzaSy_from_bearer")
+	if key := extractAPIKey(req, nil); key != "AIzaSy_from_bearer" {
+		t.Errorf("Expected AIzaSy_from_bearer, got %q", key)
+	}
+
+	// 2. x-api-key
+	req = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("x-api-key", "AIzaSy_from_x_api_key")
+	if key := extractAPIKey(req, nil); key != "AIzaSy_from_x_api_key" {
+		t.Errorf("Expected AIzaSy_from_x_api_key, got %q", key)
+	}
+
+	// 3. X-Goog-Api-Key
+	req = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("X-Goog-Api-Key", "AIzaSy_from_goog_header")
+	if key := extractAPIKey(req, nil); key != "AIzaSy_from_goog_header" {
+		t.Errorf("Expected AIzaSy_from_goog_header, got %q", key)
+	}
+
+	// 4. Query param ?key=
+	req = httptest.NewRequest("POST", "/v1/chat/completions?key=AIzaSy_from_query", nil)
+	if key := extractAPIKey(req, nil); key != "AIzaSy_from_query" {
+		t.Errorf("Expected AIzaSy_from_query, got %q", key)
+	}
+
+	// 5. Body field api_key
+	req = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	body := &OpenAIChatCompletionRequest{APIKey: "AIzaSy_from_body"}
+	if key := extractAPIKey(req, body); key != "AIzaSy_from_body" {
+		t.Errorf("Expected AIzaSy_from_body, got %q", key)
+	}
+
+	// 6. Dummy / placeholder tokens ignored
+	req = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer dummy")
+	if key := extractAPIKey(req, nil); key != "" {
+		t.Errorf("Expected dummy to be rejected, got %q", key)
+	}
+}
+
+func TestChatCompletionsTruncateDirective(t *testing.T) {
+	mock := &MockProvider{}
+	oldProvider := googleProvider
+	googleProvider = mock
+	defer func() { googleProvider = oldProvider }()
+
+	bodyJSON := `{
+		"model": "google/ws/gemini-3.1-flash-live-preview:truncate(all, 100)",
+		"messages": [
+			{"role": "user", "content": "` + strings.Repeat("X", 500) + `"},
+			{"role": "tool", "name": "read_file", "tool_call_id": "call_123", "content": "` + strings.Repeat("Y", 600) + `"}
+		]
+	}`
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(bodyJSON))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handleChatCompletions(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if mock.LastReq == nil {
+		t.Fatalf("Expected mock provider to receive request")
+	}
+
+	// 1. Base model must be cleaned
+	if mock.LastReq.Model != "google/ws/gemini-3.1-flash-live-preview" {
+		t.Errorf("Expected cleaned base model, got %q", mock.LastReq.Model)
+	}
+
+	// 2. User input truncated to <= 100 runes
+	userText := mock.LastReq.Messages[0].Content[0].Text
+	if len([]rune(userText)) > 100 {
+		t.Errorf("Expected user message <= 100 runes, got %d", len([]rune(userText)))
+	}
+
+	// 3. Function response truncated to <= 100 runes
+	funcText := mock.LastReq.Messages[1].Content[0].Text
+	if len([]rune(funcText)) > 100 {
+		t.Errorf("Expected function response <= 100 runes, got %d", len([]rune(funcText)))
+	}
+	if !strings.Contains(funcText, "[truncated") {
+		t.Errorf("Expected truncation marker in function response: %s", funcText)
+	}
+
+	// 4. Response JSON maintains requested model ID for client compatibility
+	var respMap map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &respMap); err == nil {
+		if respModel, ok := respMap["model"].(string); ok {
+			if respModel != "google/ws/gemini-3.1-flash-live-preview:truncate(all, 100)" {
+				t.Errorf("Expected client response model to match requested model, got %q", respModel)
+			}
+		}
+	}
+}
+
+

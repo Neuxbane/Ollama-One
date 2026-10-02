@@ -5,6 +5,9 @@ import (
 	"sync/atomic"
 )
 
+// PreChatHook is an optional pre-processing hook executed before provider Chat handling (e.g., model middleware)
+var PreChatHook func(*CompletionRequest) error
+
 // BaseProvider handles shared functionality like API key rotation
 type BaseProvider struct {
 	APIKeys         []string
@@ -48,8 +51,9 @@ type ToolCall struct {
 	ID       string        `json:"id,omitempty"`
 	Type     string        `json:"type,omitempty"` // e.g., "function"
 	Function FunctionCall  `json:"function,omitempty"`
-	Name     string        `json:"name,omitempty"`
-	Arguments string        `json:"arguments,omitempty"` // JSON string (for backwards compatibility)
+	Name             string        `json:"name,omitempty"`
+	Arguments        string        `json:"arguments,omitempty"` // JSON string (for backwards compatibility)
+	ThoughtSignature string        `json:"thought_signature,omitempty"`
 }
 
 // Tool represents a tool definition
@@ -88,6 +92,7 @@ type Message struct {
 
 // CompletionRequest defines the input for a chat completion
 type CompletionRequest struct {
+	APIKey            string          `json:"api_key,omitempty"`
 	Model             string          `json:"model"`
 	SystemInstruction string          `json:"system_instruction,omitempty"`
 	Messages          []Message       `json:"messages"`
@@ -114,5 +119,6 @@ type ModelInfo struct {
 // Provider is the interface that all LLM providers must implement
 type Provider interface {
 	ListModels(ctx context.Context) ([]ModelInfo, error)
+	ListModelsWithKey(ctx context.Context, apiKey string) ([]ModelInfo, error)
 	Chat(ctx context.Context, req *CompletionRequest, onChunk func(*CompletionResponse)) (*CompletionResponse, error)
 }

@@ -3,3 +3,4 @@ log/
 generated/
 ollama-one
 Ollama-One
+*.tar.gz

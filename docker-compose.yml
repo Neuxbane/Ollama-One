@@ -6,6 +6,7 @@ services:
       - "11434:11434"
     environment:
       - HOST=0.0.0.0
-    volumes:
-      - ./config.json:/app/config.json
+    # Optional: uncomment to mount config.json for static server-wide keys
+    # volumes:
+    #   - ./config.json:/app/config.json:ro
     restart: unless-stopped

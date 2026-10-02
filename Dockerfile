@@ -18,7 +18,6 @@ RUN apk --no-cache add ca-certificates
 WORKDIR /app
 
 COPY --from=builder /app/ollama-one .
-COPY --from=builder /app/config.json .
 
 ENV HOST=0.0.0.0
 
