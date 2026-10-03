@@ -1,7 +1,7 @@
 services:
-  ollama-one:
+  warpgate:
     build: .
-    container_name: ollama-one
+    container_name: warpgate
     ports:
       - "11434:11434"
     environment:
@@ -9,4 +9,10 @@ services:
     # Optional: uncomment to mount config.json for static server-wide keys
     # volumes:
     #   - ./config.json:/app/config.json:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:11434/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
     restart: unless-stopped

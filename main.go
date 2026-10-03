@@ -82,16 +82,45 @@ type OpenAIChatCompletionRequest struct {
 }
 
 var (
-	googleProvider providers.Provider
-	sessionManager = NewSessionManager()
+	googleProvider   providers.Provider
+	deepseekProvider providers.Provider
+	sessionManager   = NewSessionManager()
 )
+
+func init() {
+	googleProvider = providers.NewGoogleProvider(nil)
+	deepseekProvider = providers.NewDeepSeekProvider(nil)
+}
+
+func isDeepSeekModel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(m, "deepseek/") ||
+		strings.HasPrefix(m, "deepseek-") ||
+		m == "deepseek"
+}
+
+func getProviderForModel(model string) providers.Provider {
+	if isDeepSeekModel(model) {
+		return deepseekProvider
+	}
+	return googleProvider
+}
+
+func getSystemFingerprint(model string) string {
+	if isDeepSeekModel(model) {
+		return "fp_deepseek_proxy"
+	}
+	return "fp_google_proxy"
+}
 
 func main() {
 	var googleKeys []string
+	var deepseekKeys []string
 
 	log.Println("[CONFIG] Running in strictly stateless mode (provide API key per-request via 'Authorization: Bearer <key>', 'x-api-key', or '?key=<key>')")
 
 	googleProvider = providers.NewGoogleProvider(googleKeys)
+	deepseekProvider = providers.NewDeepSeekProvider(deepseekKeys)
 
 	mux := http.NewServeMux()
 
@@ -105,12 +134,23 @@ func main() {
 	mux.HandleFunc("/v1/models/", handleModels)
 	mux.HandleFunc("/models/", handleModels)
 
+	// Health check endpoint
+	mux.HandleFunc("/healthz", handleHealth)
+
+	// Static landing page + documentation assets (embedded in the binary).
+	static := staticHandler()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		json.NewEncoder(w).Encode(map[string]any{
-			"status":  "ok",
-			"service": "google-ai-proxy",
-		})
+		// Only serve the static site for the root path and known asset paths.
+		// Any other unmatched path is a genuine 404 (e.g. a mistyped API route).
+		if r.URL.Path == "/" || r.URL.Path == "/index.html" {
+			static.ServeHTTP(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/assets/") {
+			http.StripPrefix("/assets/", static).ServeHTTP(w, r)
+			return
+		}
+		handleNotFound(w, r)
 	})
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -160,7 +200,7 @@ func main() {
 		addr := fmt.Sprintf("%s:%s", host, p)
 		listener, err := net.Listen("tcp", addr)
 		if err == nil {
-			fmt.Printf("Google AI Proxy starting on http://%s...\n", addr)
+			fmt.Printf("WarpGate starting on http://%s...\n", addr)
 			if err := http.Serve(listener, handler); err != nil {
 				fmt.Printf("Error running server: %v\n", err)
 			}
@@ -396,11 +436,17 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	internalReq := &providers.CompletionRequest{
-		APIKey:   apiKey,
-		Model:    req.Model,
-		Messages: internalMessages,
-		Tools:    internalTools,
-		Stream:   req.Stream,
+		APIKey:      apiKey,
+		Model:       req.Model,
+		Messages:    internalMessages,
+		Tools:       internalTools,
+		Stream:      req.Stream,
+		Temperature: req.Temperature,
+		TopP:        req.TopP,
+		MaxTokens:   req.MaxTokens,
+	}
+	if req.MaxCompletionTokens != nil && internalReq.MaxTokens == nil {
+		internalReq.MaxTokens = req.MaxCompletionTokens
 	}
 
 	if req.ReasoningEffort != "" {
@@ -440,6 +486,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	completionID := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	createdTime := time.Now().Unix()
+	provider := getProviderForModel(internalReq.Model)
+	systemFingerprint := getSystemFingerprint(internalReq.Model)
 
 	if req.Stream {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -457,7 +505,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			"object":             "chat.completion.chunk",
 			"created":            createdTime,
 			"model":              req.Model,
-			"system_fingerprint": "fp_google_proxy",
+			"system_fingerprint": systemFingerprint,
 			"choices": []any{
 				map[string]any{
 					"index":         0,
@@ -475,8 +523,12 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		var fullContent strings.Builder
 		var allStreamToolCalls []providers.ToolCall
 
-		_, err := googleProvider.Chat(r.Context(), internalReq, func(chunk *providers.CompletionResponse) {
+		_, err := middleware.ExecuteChat(r.Context(), provider, internalReq, func(chunk *providers.CompletionResponse) {
 			delta := map[string]any{}
+
+			if chunk.Thought != "" {
+				delta["reasoning_content"] = chunk.Thought
+			}
 
 			if chunk.Content != "" {
 				delta["content"] = chunk.Content
@@ -519,7 +571,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				"object":             "chat.completion.chunk",
 				"created":            createdTime,
 				"model":              req.Model,
-				"system_fingerprint": "fp_google_proxy",
+				"system_fingerprint": systemFingerprint,
 				"choices": []any{
 					map[string]any{
 						"index":         0,
@@ -543,7 +595,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				"object":             "chat.completion.chunk",
 				"created":            createdTime,
 				"model":              req.Model,
-				"system_fingerprint": "fp_google_proxy",
+				"system_fingerprint": systemFingerprint,
 				"choices": []any{
 					map[string]any{
 						"index":         0,
@@ -579,7 +631,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			"object":             "chat.completion.chunk",
 			"created":            createdTime,
 			"model":              req.Model,
-			"system_fingerprint": "fp_google_proxy",
+			"system_fingerprint": systemFingerprint,
 			"choices": []any{
 				map[string]any{
 					"index":         0,
@@ -600,7 +652,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				"object":             "chat.completion.chunk",
 				"created":            createdTime,
 				"model":              req.Model,
-				"system_fingerprint": "fp_google_proxy",
+				"system_fingerprint": systemFingerprint,
 				"choices": []any{
 					map[string]any{
 						"index":         0,
@@ -625,7 +677,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := googleProvider.Chat(r.Context(), internalReq, nil)
+	resp, err := middleware.ExecuteChat(r.Context(), provider, internalReq, nil)
 	if err != nil {
 		log.Printf("[Chat] Error: %v", err)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -634,7 +686,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			"object":             "chat.completion",
 			"created":            createdTime,
 			"model":              req.Model,
-			"system_fingerprint": "fp_google_proxy",
+			"system_fingerprint": systemFingerprint,
 			"choices": []any{
 				map[string]any{
 					"index": 0,
@@ -669,6 +721,9 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	msgObj := map[string]any{"role": "assistant"}
+	if resp.Thought != "" {
+		msgObj["reasoning_content"] = resp.Thought
+	}
 	if hasToolCalls && resp.Content == "" {
 		msgObj["content"] = nil
 	} else {
@@ -707,7 +762,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		"object":             "chat.completion",
 		"created":            createdTime,
 		"model":              req.Model,
-		"system_fingerprint": "fp_google_proxy",
+		"system_fingerprint": systemFingerprint,
 		"choices": []any{
 			map[string]any{
 				"index":         0,
@@ -726,6 +781,30 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(finalResp)
 }
 
+// handleHealth is a lightweight liveness/readiness probe.
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(map[string]any{
+		"status":  "ok",
+		"service": "warpgate",
+		"mode":    "stateless",
+	})
+}
+
+// handleNotFound returns a structured JSON 404 for unknown API routes while
+// keeping the response friendly for browsers hitting the root domain.
+func handleNotFound(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusNotFound)
+	json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"message": fmt.Sprintf("Unknown route: %s %s", r.Method, r.URL.Path),
+			"type":    "invalid_request_error",
+			"code":    "not_found",
+		},
+	})
+}
+
 func handleModels(w http.ResponseWriter, r *http.Request) {
 	type openAIModel struct {
 		ID      string `json:"id"`
@@ -740,29 +819,55 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 
 	if path != "" {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		ownedBy := "google"
+		if isDeepSeekModel(path) {
+			ownedBy = "deepseek"
+		}
 		json.NewEncoder(w).Encode(openAIModel{
 			ID:      path,
 			Object:  "model",
 			Created: 1700000000,
-			OwnedBy: "google",
+			OwnedBy: ownedBy,
 		})
 		return
 	}
 
 	apiKey := extractAPIKey(r, nil)
-	models, err := googleProvider.ListModelsWithKey(r.Context(), apiKey)
+	var modelsList []openAIModel
+	seen := make(map[string]bool)
+
+	// List models from DeepSeek
+	deepseekModels, err := deepseekProvider.ListModelsWithKey(r.Context(), apiKey)
 	if err != nil {
-		log.Printf("[API] Error listing models: %v", err)
+		log.Printf("[API] Error listing deepseek models: %v", err)
+	}
+	for _, m := range deepseekModels {
+		if !seen[m.ID] {
+			seen[m.ID] = true
+			modelsList = append(modelsList, openAIModel{
+				ID:      m.ID,
+				Object:  "model",
+				Created: 1700000000,
+				OwnedBy: "deepseek",
+			})
+		}
 	}
 
-	var modelsList []openAIModel
-	for _, m := range models {
-		modelsList = append(modelsList, openAIModel{
-			ID:      m.ID,
-			Object:  "model",
-			Created: 1700000000,
-			OwnedBy: "google",
-		})
+	// List models from Google
+	googleModels, err := googleProvider.ListModelsWithKey(r.Context(), apiKey)
+	if err != nil {
+		log.Printf("[API] Error listing google models: %v", err)
+	}
+	for _, m := range googleModels {
+		if !seen[m.ID] {
+			seen[m.ID] = true
+			modelsList = append(modelsList, openAIModel{
+				ID:      m.ID,
+				Object:  "model",
+				Created: 1700000000,
+				OwnedBy: "google",
+			})
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")

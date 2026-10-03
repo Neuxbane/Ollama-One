@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -546,5 +547,228 @@ func TestChatCompletionsTruncateDirective(t *testing.T) {
 		}
 	}
 }
+
+func TestDeepSeekRoutingAndCompletions(t *testing.T) {
+	mockDS := &MockProvider{
+		Resp: &providers.CompletionResponse{
+			Content: "Response from DeepSeek",
+			Thought: "Deep reasoning...",
+		},
+	}
+	oldDS := deepseekProvider
+	deepseekProvider = mockDS
+	defer func() { deepseekProvider = oldDS }()
+
+	bodyJSON := `{
+		"model": "deepseek/deepseek-chat:truncate(all, 200)",
+		"messages": [
+			{"role": "user", "content": "Hello DeepSeek"}
+		]
+	}`
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(bodyJSON))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handleChatCompletions(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if mockDS.LastReq == nil {
+		t.Fatalf("Expected deepseekProvider to receive the request")
+	}
+
+	if mockDS.LastReq.Model != "deepseek/deepseek-chat" {
+		t.Errorf("Expected cleaned base model deepseek/deepseek-chat, got %q", mockDS.LastReq.Model)
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to parse JSON response: %v", err)
+	}
+
+	choices, ok := resp["choices"].([]any)
+	if !ok || len(choices) == 0 {
+		t.Fatalf("Invalid or missing choices in response")
+	}
+	choice := choices[0].(map[string]any)
+	msg := choice["message"].(map[string]any)
+
+	if msg["content"] != "Response from DeepSeek" {
+		t.Errorf("Expected content 'Response from DeepSeek', got %v", msg["content"])
+	}
+	if msg["reasoning_content"] != "Deep reasoning..." {
+		t.Errorf("Expected reasoning_content 'Deep reasoning...', got %v", msg["reasoning_content"])
+	}
+	if resp["system_fingerprint"] != "fp_deepseek_proxy" {
+		t.Errorf("Expected system_fingerprint fp_deepseek_proxy, got %v", resp["system_fingerprint"])
+	}
+}
+
+func TestDeepSeekModelsEndpoint(t *testing.T) {
+	// Single model query
+	req := httptest.NewRequest("GET", "/v1/models/deepseek-chat", nil)
+	w := httptest.NewRecorder()
+	handleModels(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected 200 OK, got %d", w.Code)
+	}
+
+	var singleModel map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &singleModel); err != nil {
+		t.Fatalf("Failed to decode model JSON: %v", err)
+	}
+	if singleModel["id"] != "deepseek-chat" || singleModel["owned_by"] != "deepseek" {
+		t.Errorf("Unexpected single model response: %+v", singleModel)
+	}
+
+	// Models list
+	reqList := httptest.NewRequest("GET", "/v1/models", nil)
+	wList := httptest.NewRecorder()
+	handleModels(wList, reqList)
+
+	if wList.Code != http.StatusOK {
+		t.Fatalf("Expected 200 OK, got %d", wList.Code)
+	}
+
+	var listResp struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID      string `json:"id"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(wList.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("Failed to decode models list: %v", err)
+	}
+
+	hasDeepSeek := false
+	hasGoogle := false
+	for _, m := range listResp.Data {
+		if strings.Contains(m.ID, "deepseek") && m.OwnedBy == "deepseek" {
+			hasDeepSeek = true
+		}
+		if strings.Contains(m.ID, "gemini") && m.OwnedBy == "google" {
+			hasGoogle = true
+		}
+	}
+
+	if !hasDeepSeek {
+		t.Errorf("Expected deepseek models in /v1/models output")
+	}
+	if !hasGoogle {
+		t.Errorf("Expected google models in /v1/models output")
+	}
+}
+
+type mockWarpServerProvider struct {
+	turn int
+}
+
+func (m *mockWarpServerProvider) ListModels(ctx context.Context) ([]providers.ModelInfo, error) {
+	return nil, nil
+}
+func (m *mockWarpServerProvider) ListModelsWithKey(ctx context.Context, apiKey string) ([]providers.ModelInfo, error) {
+	return nil, nil
+}
+func (m *mockWarpServerProvider) Chat(ctx context.Context, req *providers.CompletionRequest, onChunk func(*providers.CompletionResponse)) (*providers.CompletionResponse, error) {
+	m.turn++
+	if m.turn == 1 {
+		return &providers.CompletionResponse{
+			ToolCalls: []providers.ToolCall{
+				{
+					ID:   "call_search_1",
+					Type: "function",
+					Function: providers.FunctionCall{
+						Name:      "searchTools",
+						Arguments: `{"query": "file editor"}`,
+					},
+				},
+			},
+		}, nil
+	}
+	return &providers.CompletionResponse{
+		ToolCalls: []providers.ToolCall{
+			{
+				ID:   "call_exec_1",
+				Type: "function",
+				Function: providers.FunctionCall{
+					Name:      "execute",
+					Arguments: `{"tools": [{"name": "write_file", "arguments": {"path": "test.txt", "content": "hello"}}]}`,
+				},
+			},
+		},
+	}, nil
+}
+
+func TestChatCompletionsWarpToolsDirective(t *testing.T) {
+	mock := &mockWarpServerProvider{}
+	oldProvider := googleProvider
+	googleProvider = mock
+	defer func() { googleProvider = oldProvider }()
+
+	var tools []map[string]any
+	tools = append(tools, map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        "write_file",
+			"description": "Write contents to a file on disk",
+			"parameters":  map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string"}}},
+		},
+	})
+	for i := 2; i <= 15; i++ {
+		tools = append(tools, map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        fmt.Sprintf("other_tool_%d", i),
+				"description": fmt.Sprintf("Unrelated tool %d", i),
+			},
+		})
+	}
+
+	reqBody := map[string]any{
+		"model": "gemini-2.0-flash:warp_tools(top_k=5)",
+		"messages": []map[string]any{
+			{"role": "user", "content": "Write to test.txt"},
+		},
+		"tools": tools,
+	}
+
+	bodyJSON, _ := json.Marshal(reqBody)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewBuffer(bodyJSON))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handleChatCompletions(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Failed to parse JSON response: %v", err)
+	}
+
+	choices := resp["choices"].([]any)
+	msg := choices[0].(map[string]any)["message"].(map[string]any)
+	toolCalls, ok := msg["tool_calls"].([]any)
+	if !ok || len(toolCalls) != 1 {
+		t.Fatalf("Expected 1 unwrapped tool call, got %+v", msg)
+	}
+
+	tc := toolCalls[0].(map[string]any)
+	fn := tc["function"].(map[string]any)
+	if fn["name"] != "write_file" {
+		t.Errorf("Expected unwrapped tool name write_file, got %v", fn["name"])
+	}
+	if !strings.Contains(fmt.Sprint(fn["arguments"]), "test.txt") {
+		t.Errorf("Expected test.txt in arguments, got %v", fn["arguments"])
+	}
+}
+
 
 

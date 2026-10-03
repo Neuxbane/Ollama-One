@@ -1,12 +1,12 @@
 #!/bin/bash
 set -e
 
-APP_NAME="ollama-one"
+APP_NAME="warpgate"
 IMAGE_TAG="${APP_NAME}:latest"
 TAR_FILE="${APP_NAME}-docker.tar.gz"
 
 echo "=========================================="
-echo " Building Ollama-One (Stateless)"
+echo ' Building WarpGate (Stateless)'
 echo "=========================================="
 
 # 1. Build local Go binary

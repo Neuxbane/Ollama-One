@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WarpGate — Stateless AI Gateway &amp; Proxy</title>
+    <meta name="description" content="A strictly stateless, high-performance proxy that exposes Google Gemini and DeepSeek through the OpenAI Chat Completions API. Native tool calling, semantic tool retrieval, extended thinking, and dynamic model middleware.">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%237c3aed'/%3E%3Cpath d='M30 70V30l40 40V30' stroke='white' stroke-width='10' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+    <style>
+        :root {
+            --bg: #05060f;
+            --bg-soft: #0b0d1c;
+            --panel: #10132a;
+            --panel-2: #161a35;
+            --border: #232848;
+            --border-soft: #1a1e3a;
+            --text: #e6e8f5;
+            --muted: #9aa0c3;
+            --muted-2: #6b7196;
+            --violet: #8b5cf6;
+            --violet-soft: #a78bfa;
+            --fuchsia: #e879f9;
+            --cyan: #22d3ee;
+            --green: #34d399;
+            --amber: #fbbf24;
+            --radius: 16px;
+            --radius-lg: 24px;
+            --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+            --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        }
+
+        * { box-sizing: border-box; }
+
+        html { scroll-behavior: smooth; scroll-padding-top: 90px; }
+
+        body {
+            margin: 0;
+            font-family: var(--sans);
+            background:
+                radial-gradient(1200px 600px at 80% -10%, rgba(139, 92, 246, 0.18), transparent 60%),
+                radial-gradient(900px 500px at 0% 10%, rgba(34, 211, 238, 0.10), transparent 55%),
+                var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        a { color: var(--violet-soft); text-decoration: none; }
+        a:hover { color: var(--fuchsia); }
+
+        .wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px; }
+
+        /* ---------- Header ---------- */
+        header {
+            position: sticky;
+            top: 0;
+            z-index: 50;
+            backdrop-filter: blur(14px);
+            background: rgba(5, 6, 15, 0.78);
+            border-bottom: 1px solid var(--border-soft);
+        }
+        .nav {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 0;
+        }
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-weight: 800;
+            font-size: 1.25rem;
+            letter-spacing: -0.02em;
+            color: #fff;
+        }
+        .brand .logo {
+            width: 30px; height: 30px;
+            border-radius: 9px;
+            background: linear-gradient(135deg, var(--violet), var(--fuchsia));
+            display: grid; place-items: center;
+            box-shadow: 0 6px 20px rgba(139, 92, 246, 0.45);
+        }
+        .brand .logo svg { width: 18px; height: 18px; }
+        .nav-links { display: flex; align-items: center; gap: 26px; }
+        .nav-links a { color: var(--muted); font-size: 0.92rem; font-weight: 500; }
+        .nav-links a:hover { color: #fff; }
+        .btn {
+            display: inline-flex; align-items: center; gap: 8px;
+            padding: 10px 20px;
+            border-radius: 999px;
+            font-weight: 600;
+            font-size: 0.9rem;
+            border: 1px solid transparent;
+            cursor: pointer;
+            transition: transform .15s ease, background .15s ease, border-color .15s ease;
+        }
+        .btn:hover { transform: translateY(-1px); }
+        .btn-primary { background: linear-gradient(135deg, var(--violet), var(--fuchsia)); color: #fff; box-shadow: 0 8px 24px rgba(139, 92, 246, 0.35); }
+        .btn-ghost { background: var(--panel); color: var(--text); border-color: var(--border); }
+        .btn-ghost:hover { border-color: var(--violet); }
+
+        /* ---------- Hero ---------- */
+        .hero {
+            display: grid;
+            grid-template-columns: 1.05fr 0.95fr;
+            gap: 56px;
+            align-items: center;
+            padding: 84px 0 72px;
+        }
+        .pill {
+            display: inline-flex; align-items: center; gap: 8px;
+            padding: 6px 14px;
+            border-radius: 999px;
+            background: rgba(139, 92, 246, 0.12);
+            border: 1px solid rgba(139, 92, 246, 0.35);
+            color: var(--violet-soft);
+            font-size: 0.78rem;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+            text-transform: uppercase;
+        }
+        .pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 10px var(--green); }
+        h1 {
+            font-size: clamp(2.6rem, 5.5vw, 4rem);
+            line-height: 1.05;
+            letter-spacing: -0.035em;
+            margin: 22px 0 20px;
+            font-weight: 800;
+        }
+        .grad { background: linear-gradient(120deg, var(--violet-soft), var(--fuchsia) 60%, var(--cyan)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+        .lede { font-size: 1.18rem; color: var(--muted); max-width: 34rem; }
+        .hero-cta { display: flex; gap: 14px; margin-top: 32px; flex-wrap: wrap; }
+
+        .endpoint-card {
+            background: linear-gradient(180deg, var(--panel), var(--bg-soft));
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            padding: 26px;
+            box-shadow: 0 30px 60px -30px rgba(0,0,0,0.9);
+        }
+        .endpoint-card .label { display: flex; justify-content: space-between; align-items: center; color: var(--muted-2); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 14px; }
+        .tag { font-family: var(--mono); font-size: 0.7rem; padding: 3px 10px; border-radius: 999px; background: rgba(34, 211, 238, 0.12); color: var(--cyan); border: 1px solid rgba(34, 211, 238, 0.3); }
+        .endpoint {
+            font-family: var(--mono);
+            font-size: 1.02rem;
+            background: #04050d;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 16px 18px;
+            color: var(--violet-soft);
+            overflow-x: auto;
+            white-space: nowrap;
+        }
+        .endpoint .scheme { color: var(--muted-2); }
+        .endpoint .path { color: var(--cyan); }
+        .endpoint-card .hint { color: var(--muted-2); font-size: 0.82rem; margin: 16px 0 0; }
+
+        /* ---------- Feature grid ---------- */
+        .features { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; padding: 8px 0 40px; }
+        .feature {
+            background: var(--panel);
+            border: 1px solid var(--border-soft);
+            border-radius: var(--radius);
+            padding: 22px;
+            transition: border-color .2s ease, transform .2s ease;
+        }
+        .feature:hover { border-color: var(--violet); transform: translateY(-3px); }
+        .feature .ico { font-size: 1.5rem; margin-bottom: 10px; }
+        .feature h3 { margin: 0 0 6px; font-size: 1.02rem; color: #fff; }
+        .feature p { margin: 0; color: var(--muted); font-size: 0.9rem; }
+
+        /* ---------- Sections ---------- */
+        section { padding: 56px 0; }
+        .section-head { margin-bottom: 34px; }
+        .section-head h2 { font-size: clamp(1.8rem, 3.5vw, 2.4rem); letter-spacing: -0.03em; margin: 0 0 10px; color: #fff; }
+        .section-head p { color: var(--muted); margin: 0; max-width: 46rem; font-size: 1.02rem; }
+
+        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+
+        .card {
+            background: var(--panel);
+            border: 1px solid var(--border-soft);
+            border-radius: var(--radius);
+            overflow: hidden;
+        }
+        .card-head {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 14px 18px;
+            border-bottom: 1px solid var(--border-soft);
+            background: var(--panel-2);
+            font-size: 0.85rem;
+            color: var(--muted);
+            font-weight: 600;
+        }
+        .card-head .lang { font-family: var(--mono); font-size: 0.72rem; color: var(--violet-soft); }
+        pre {
+            margin: 0;
+            padding: 18px;
+            overflow-x: auto;
+            font-family: var(--mono);
+            font-size: 0.82rem;
+            line-height: 1.65;
+            color: #cdd3f0;
+            background: #04050d;
+        }
+        code { font-family: var(--mono); }
+        .tok-key { color: var(--fuchsia); }
+        .tok-str { color: var(--green); }
+        .tok-fn  { color: var(--cyan); }
+        .tok-com { color: var(--muted-2); font-style: italic; }
+        .tok-num { color: var(--amber); }
+
+        /* ---------- Tables ---------- */
+        .table-wrap { overflow-x: auto; border: 1px solid var(--border-soft); border-radius: var(--radius); }
+        table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+        th, td { text-align: left; padding: 13px 18px; border-bottom: 1px solid var(--border-soft); }
+        th { background: var(--panel-2); color: var(--muted); font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em; }
+        tr:last-child td { border-bottom: none; }
+        td code, th code { background: rgba(139,92,246,0.12); color: var(--violet-soft); padding: 2px 7px; border-radius: 6px; font-size: 0.82rem; }
+
+        /* ---------- Callouts ---------- */
+        .callout {
+            display: flex; gap: 14px;
+            padding: 16px 18px;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            background: var(--panel);
+            margin: 18px 0;
+            font-size: 0.9rem;
+            color: var(--muted);
+        }
+        .callout.tip { border-color: rgba(52, 211, 153, 0.35); background: rgba(52, 211, 153, 0.06); }
+        .callout.warn { border-color: rgba(251, 191, 36, 0.35); background: rgba(251, 191, 36, 0.06); }
+        .callout .ci { font-size: 1.1rem; }
+        .callout strong { color: var(--text); }
+
+        /* ---------- Steps ---------- */
+        .steps { counter-reset: step; display: grid; gap: 16px; }
+        .step { position: relative; padding: 20px 22px 20px 66px; background: var(--panel); border: 1px solid var(--border-soft); border-radius: var(--radius); }
+        .step::before {
+            counter-increment: step; content: counter(step);
+            position: absolute; left: 20px; top: 20px;
+            width: 30px; height: 30px; border-radius: 50%;
+            display: grid; place-items: center;
+            background: linear-gradient(135deg, var(--violet), var(--fuchsia));
+            color: #fff; font-weight: 700; font-size: 0.85rem;
+        }
+        .step h4 { margin: 0 0 6px; color: #fff; font-size: 1rem; }
+        .step p { margin: 0; color: var(--muted); font-size: 0.9rem; }
+
+        /* ---------- Footer ---------- */
+        footer { border-top: 1px solid var(--border-soft); margin-top: 40px; padding: 40px 0; color: var(--muted-2); font-size: 0.88rem; }
+        .footer-inner { display: flex; justify-content: space-between; align-items: center; gap: 20px; flex-wrap: wrap; }
+        .footer-inner a { color: var(--muted); }
+
+        /* ---------- Responsive ---------- */
+        @media (max-width: 900px) {
+            .hero { grid-template-columns: 1fr; gap: 36px; padding: 56px 0 40px; }
+            .features { grid-template-columns: 1fr 1fr; }
+            .grid-2 { grid-template-columns: 1fr; }
+            .nav-links a:not(.btn) { display: none; }
+        }
+        @media (max-width: 560px) {
+            .features { grid-template-columns: 1fr; }
+            .wrap { padding: 0 18px; }
+        }
+    </style>
+</head>
+<body>
+
+<header>
+    <div class="wrap nav">
+        <div class="brand">
+            <span class="logo" aria-hidden="true">
+                <svg viewBox="0 0 100 100" fill="none"><path d="M30 70V30l40 40V30" stroke="white" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </span>
+            <span>WarpGate</span>
+        </div>
+        <nav class="nav-links">
+            <a href="#features">Features</a>
+            <a href="#quickstart">Quick&nbsp;Start</a>
+            <a href="#models">Models</a>
+            <a href="#middleware">Middleware</a>
+            <a href="#api">API</a>
+            <a class="btn btn-primary" href="https://github.com/Neuxbane/Ollama-One" target="_blank" rel="noopener">GitHub</a>
+        </nav>
+    </div>
+</header>
+
+<main class="wrap">
+
+    <!-- Hero -->
+    <section class="hero" style="padding-top:64px;">
+        <div>
+            <span class="pill"><span class="dot"></span> Stateless · Multi-Provider · Zero-Config</span>
+            <h1>Speak <span class="grad">OpenAI</span>.<br>Run on <span class="grad">Gemini &amp; DeepSeek</span>.</h1>
+            <p class="lede">
+                WarpGate is a strictly stateless, high-performance gateway that exposes Google Gemini
+                and DeepSeek through the OpenAI Chat Completions API — with native tool calling, semantic
+                tool retrieval (<code>:warp_tools</code>), multimodal vision, extended thinking, and dynamic model middleware.
+            </p>
+            <div class="hero-cta">
+                <a class="btn btn-primary" href="#quickstart">Quick Start →</a>
+                <a class="btn btn-ghost" href="#api">API Reference</a>
+            </div>
+        </div>
+        <div class="endpoint-card">
+            <div class="label"><span>Base URL</span><span class="tag">base_url</span></div>
+            <div class="endpoint"><span class="scheme">https://</span>proxy.ai.sesh.top<span class="path">/v1</span></div>
+            <p class="hint">Point any OpenAI-compatible client at this URL and pass your Gemini or DeepSeek API key per request. No server-side secrets, no shared state.</p>
+        </div>
+    </section>
+
+    <!-- Features -->
+    <section id="features" style="padding-top:0;">
+        <div class="features">
+            <div class="feature"><div class="ico">🛡️</div><h3>100% Stateless</h3><p>No <code>config.json</code> needed. Supply your Gemini or DeepSeek key per request via header, query, or body.</p></div>
+            <div class="feature"><div class="ico">🛠️</div><h3>Tool Calling</h3><p>Full OpenAI tool-call compatibility for agent workflows, including streaming deltas.</p></div>
+            <div class="feature"><div class="ico">⚡</div><h3>WarpTools Semantic Search</h3><p>Dynamic tool retrieval: prevents prompt bloat by searching 100+ tools locally via vector embeddings.</p></div>
+            <div class="feature"><div class="ico">🧠</div><h3>Extended Thinking</h3><p>Map <code>reasoning_effort</code> to Gemini thinking budgets or DeepSeek-R1 reasoning content deltas.</p></div>
+            <div class="feature"><div class="ico">👁️</div><h3>Multimodal Vision</h3><p>Image and screenshot analysis via <code>image_url</code> or data URIs.</p></div>
+            <div class="feature"><div class="ico">🧩</div><h3>Model Middleware</h3><p>Embed directives like <code>:warp_tools(top_k=10)</code> and <code>:truncate(all, 4000)</code> directly in the model ID.</p></div>
+        </div>
+    </section>
+
+    <!-- Model IDs & Routing -->
+    <section id="models" style="padding-top:0;">
+        <div class="section-head">
+            <h2>Model IDs &amp; Routing</h2>
+            <p>The model ID fully determines the provider and transport. An optional <code>:function(args)</code> directive may be appended &mdash; it is parsed off the ID and applied as middleware <em>before</em> the request is routed.</p>
+        </div>
+        <div class="table-wrap">
+            <table>
+                <thead><tr><th>Prefix / Pattern</th><th>Provider &amp; Transport</th><th>Example</th></tr></thead>
+                <tbody>
+                    <tr><td><code>deepseek/&lt;model&gt;</code> or <code>deepseek-*</code></td><td>DeepSeek REST API (OpenAI Format)</td><td><code>deepseek/deepseek-chat</code>, <code>deepseek-reasoner</code></td></tr>
+                    <tr><td><code>google/ws/&lt;model&gt;</code></td><td>Gemini Live WebSocket (Bidi)</td><td><code>google/ws/gemini-3.1-flash-live-preview</code></td></tr>
+                    <tr><td><code>google/&lt;model&gt;</code> or bare</td><td>Gemini REST API</td><td><code>google/gemini-2.5-pro</code>, <code>gemini-2.0-flash</code></td></tr>
+                </tbody>
+            </table>
+        </div>
+        <div class="callout">
+            <span class="ci">🧭</span>
+            <div>Directives are stripped before routing: <code>deepseek-chat:warp_tools(top_k=10)</code> routes as <code>deepseek-chat</code>, with <code>:warp_tools(top_k=10)</code> applied first. Unknown directives are logged and skipped.</div>
+        </div>
+        <div class="grid-2" style="margin-top:22px;">
+            <div class="card">
+                <div class="card-head"><span>DeepSeek Models</span><span class="lang">deepseek/…</span></div>
+                <pre>deepseek-chat (DeepSeek-V3 · tools, json)
+deepseek-reasoner (DeepSeek-R1 · reasoning)
+deepseek/deepseek-chat
+deepseek/deepseek-reasoner</pre>
+            </div>
+            <div class="card">
+                <div class="card-head"><span>Gemini Live (WebSocket)</span><span class="lang">google/ws/…</span></div>
+                <pre>google/ws/gemini-3.8-live-extended-thinking
+google/ws/gemini-3.8-live
+google/ws/gemini-3.1-flash-live-preview
+google/ws/gemini-2.5-flash-native-audio-preview</pre>
+            </div>
+        </div>
+    </section>
+
+    <!-- Quick Start -->
+    <section id="quickstart">
+    <!-- Quick Start -->
+    <section id="quickstart">
+        <div class="section-head">
+            <h2>Quick Start</h2>
+            <p>Point any OpenAI-compatible client at the gateway and pass your Gemini or DeepSeek API key per request. No server-side secrets, no configuration files needed.</p>
+        </div>
+
+        <div class="endpoint-card" style="margin-bottom:22px;">
+            <div class="label"><span>Base URL</span><span class="tag">base_url</span></div>
+            <div class="endpoint"><span class="scheme">https://</span>proxy.ai.sesh.top<span class="path">/v1</span></div>
+            <p class="hint">Use <code>https://proxy.ai.sesh.top/v1</code> as the <code>base_url</code> in your client, or POST directly to <code>https://proxy.ai.sesh.top/v1/chat/completions</code>.</p>
+        </div>
+
+        <div class="grid-2">
+            <div class="card">
+                <div class="card-head"><span>Python · OpenAI SDK (DeepSeek + WarpTools)</span><span class="lang">python</span></div>
+                <pre><span class="tok-key">from</span> openai <span class="tok-key">import</span> OpenAI
+
+client = OpenAI(
+    api_key=<span class="tok-str">"YOUR_DEEPSEEK_OR_GEMINI_KEY"</span>,
+    base_url=<span class="tok-str">"https://proxy.ai.sesh.top/v1"</span>,
+)
+
+resp = client.chat.completions.create(
+    model=<span class="tok-str">"deepseek-chat:warp_tools(top_k=10)"</span>,
+    messages=[{<span class="tok-str">"role"</span>: <span class="tok-str">"user"</span>, <span class="tok-str">"content"</span>: <span class="tok-str">"What's the weather in Tokyo?"</span>}],
+    tools=massive_tool_catalog,  <span class="tok-com"># 100+ tools indexed locally</span>
+)
+<span class="tok-fn">print</span>(resp.choices[<span class="tok-num">0</span>].message.content)</pre>
+            </div>
+            <div class="card">
+                <div class="card-head"><span>cURL</span><span class="lang">shell</span></div>
+                <pre>curl https://proxy.ai.sesh.top/v1/chat/completions \
+  -H <span class="tok-str">"Authorization: Bearer $DEEPSEEK_API_KEY"</span> \
+  -H <span class="tok-str">"Content-Type: application/json"</span> \
+  -d <span class="tok-str">'{
+    "model": "deepseek-chat:warp_tools(top_k=10)",
+    "messages": [{"role": "user", "content": "Hello WarpGate!"}]
+  }'</span></pre>
+            </div>
+        </div>
+    </section>
+
+    <!-- Authentication -->
+    <section id="auth">
+        <div class="section-head">
+            <h2>Authentication (Stateless)</h2>
+            <p>Because WarpGate is strictly stateless, your provider API key (Gemini or DeepSeek) travels with each request. Any of these standard locations work:</p>
+        </div>
+        <div class="table-wrap">
+            <table>
+                <thead><tr><th>Method</th><th>Example</th></tr></thead>
+                <tbody>
+                    <tr><td>Authorization header</td><td><code>Authorization: Bearer sk-…</code> or <code>Bearer AIzaSy…</code></td></tr>
+                    <tr><td>Anthropic / Ollama style</td><td><code>x-api-key: sk-…</code></td></tr>
+                    <tr><td>Google Cloud style</td><td><code>X-Goog-Api-Key: AIzaSy…</code></td></tr>
+                    <tr><td>Azure / generic</td><td><code>api-key: sk-…</code></td></tr>
+                    <tr><td>Query parameter</td><td><code>?key=…</code> or <code>?api_key=…</code></td></tr>
+                    <tr><td>JSON body</td><td><code>{ "api_key": "…", … }</code></td></tr>
+                </tbody>
+            </table>
+        </div>
+        <div class="callout warn">
+            <span class="ci">⚠️</span>
+            <div>Placeholder values such as <code>dummy</code>, <code>none</code>, <code>null</code>, <code>ollama</code>, and <code>test</code> are ignored, so clients that require a non-empty key still work.</div>
+        </div>
+    </section>
+
+    <!-- Middleware -->
+    <section id="middleware">
+        <div class="section-head">
+            <h2>Dynamic Model Middleware</h2>
+            <p>Append <code>:function(args)</code> directives to a model ID to transform requests on the fly. The base model is resolved automatically.</p>
+        </div>
+
+        <div class="card" style="margin-bottom:22px;">
+            <div class="card-head"><span>Syntax</span><span class="lang">model id</span></div>
+            <pre>REAL_MODEL_ID<span class="tok-com">:</span>FUNCTION_NAME<span class="tok-com">(</span>ARG1, ARG2, …<span class="tok-com">)</span>
+
+<span class="tok-com"># Example 1: DeepSeek with dynamic semantic tool retrieval (auto-bypasses if &le; 10 tools)</span>
+deepseek-chat<span class="tok-com">:</span>warp_tools<span class="tok-com">(</span>top_k=10<span class="tok-com">)</span>
+
+<span class="tok-com"># Example 2: Gemini Live WebSocket model, truncating parts over 4000 chars</span>
+google/ws/gemini-3.1-flash-live-preview<span class="tok-com">:</span>truncate<span class="tok-com">(</span>all, 4000<span class="tok-com">)</span></pre>
+        </div>
+
+        <div class="table-wrap">
+            <table>
+                <thead><tr><th>Directive</th><th>Scope</th><th>Description</th></tr></thead>
+                <tbody>
+                    <tr><td><code>:warp_tools(top_k=10)</code></td><td>tools</td><td>Dynamic Tool Retrieval: Replaces 100+ tools with <code>searchTools</code> and <code>execute</code> meta-tools using a 100% local semantic vector embedding index. Automatically bypasses when tools &le; <code>top_k</code>.</td></tr>
+                    <tr><td><code>:warp_tools(5)</code></td><td>tools</td><td>Shorthand for <code>:warp_tools(top_k=5)</code>.</td></tr>
+                    <tr><td><code>:truncate(all, 4000)</code></td><td>all</td><td>Truncate system prompt, user, assistant, and tool/function content.</td></tr>
+                    <tr><td><code>:truncate(tools, 2000)</code></td><td>tools</td><td>Truncate only tool/function responses and arguments.</td></tr>
+                    <tr><td><code>:truncate(user, 1000)</code></td><td>user</td><td>Truncate only user messages.</td></tr>
+                    <tr><td><code>:truncate(4000)</code></td><td>all</td><td>Shorthand for <code>:truncate(all, 4000)</code>.</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="callout">
+            <span class="ci">⚡</span>
+            <div><strong>WarpTools:</strong> Zero external API dependencies. Built-in dense subword character n-gram embeddings and domain synonyms run locally in &lt;1ms. Discovered tool calls are automatically unwrapped to standard native tool calls before returning to the client.</div>
+        </div>
+    </section>
+
+    <!-- API -->
+    <section id="api">
+        <div class="section-head">
+            <h2>API Reference</h2>
+            <p>WarpGate implements the full OpenAI Chat Completions specification. All endpoints accept the API key locations listed above.</p>
+        </div>
+        <div class="table-wrap">
+            <table>
+                <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
+                <tbody>
+                    <tr><td><code>POST</code></td><td><code>/v1/chat/completions</code></td><td>Create a chat completion (streaming SSE or non-streaming).</td></tr>
+                    <tr><td><code>GET</code></td><td><code>/v1/models</code></td><td>List all available Gemini and DeepSeek models.</td></tr>
+                    <tr><td><code>GET</code></td><td><code>/v1/models/{id}</code></td><td>Retrieve a single model descriptor.</td></tr>
+                    <tr><td><code>GET</code></td><td><code>/healthz</code></td><td>Liveness probe — returns <code>{"status":"ok","service":"warpgate"}</code>.</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="callout">
+            <span class="ci">🔌</span>
+            <div>Aliases without the <code>/v1</code> prefix (<code>/chat/completions</code>, <code>/models</code>) are also served for maximum client compatibility.</div>
+        </div>
+    </section>
+
+    <!-- VS Code -->
+    <section id="vscode">
+        <div class="section-head">
+            <h2>Connect VS Code Copilot</h2>
+            <p>Register WarpGate as a custom endpoint so Copilot Chat can use Gemini and DeepSeek models with tools, vision, and reasoning effort.</p>
+        </div>
+        <div class="steps">
+            <div class="step"><h4>Open model management</h4><p>In Copilot Chat, open the model dropdown and choose <strong>Manage Models…</strong>.</p></div>
+            <div class="step"><h4>Open the JSON config</h4><p>In the Language Models tab, click the <strong>Open Language Models (JSON)</strong> icon.</p></div>
+            <div class="step"><h4>Add the endpoint</h4><p>Paste the configuration below into <code>chatLanguageModels.json</code> and set your provider API key.</p></div>
+        </div>
+
+        <div class="card" style="margin-top:22px;">
+            <div class="card-head"><span>chatLanguageModels.json</span><span class="lang">json</span></div>
+            <pre>{
+  <span class="tok-key">"name"</span>: <span class="tok-str">"WarpGate"</span>,
+  <span class="tok-key">"vendor"</span>: <span class="tok-str">"customendpoint"</span>,
+  <span class="tok-key">"apiType"</span>: <span class="tok-str">"chat-completions"</span>,
+  <span class="tok-key">"models"</span>: [
+    {
+      <span class="tok-key">"id"</span>: <span class="tok-str">"deepseek-chat:warp_tools(top_k=10)"</span>,
+      <span class="tok-key">"name"</span>: <span class="tok-str">"DeepSeek V3 (WarpTools)"</span>,
+      <span class="tok-key">"url"</span>: <span class="tok-str">"https://proxy.ai.sesh.top/v1/chat/completions"</span>,
+      <span class="tok-key">"toolCalling"</span>: <span class="tok-num">true</span>,
+      <span class="tok-key">"maxInputTokens"</span>: <span class="tok-num">64000</span>,
+      <span class="tok-key">"maxOutputTokens"</span>: <span class="tok-num">8000</span>
+    },
+    {
+      <span class="tok-key">"id"</span>: <span class="tok-str">"google/ws/gemini-3.1-flash-live-preview:truncate(all, 4000)"</span>,
+      <span class="tok-key">"name"</span>: <span class="tok-str">"𝓖𝓮𝓶𝓲𝓷𝓲 3.1 Flash"</span>,
+      <span class="tok-key">"url"</span>: <span class="tok-str">"https://proxy.ai.sesh.top/v1/chat/completions"</span>,
+      <span class="tok-key">"toolCalling"</span>: <span class="tok-num">true</span>,
+      <span class="tok-key">"vision"</span>: <span class="tok-num">true</span>,
+      <span class="tok-key">"supportsReasoningEffort"</span>: [<span class="tok-str">"none"</span>, <span class="tok-str">"low"</span>, <span class="tok-str">"medium"</span>, <span class="tok-str">"high"</span>],
+      <span class="tok-key">"reasoningEffortFormat"</span>: <span class="tok-str">"chat-completions"</span>,
+      <span class="tok-key">"maxInputTokens"</span>: <span class="tok-num">65000</span>,
+      <span class="tok-key">"maxOutputTokens"</span>: <span class="tok-num">65000</span>
+    },
+    {
+      <span class="tok-key">"id"</span>: <span class="tok-str">"google/ws/gemini-3.8-live-extended-thinking:truncate(tools, 4000)"</span>,
+      <span class="tok-key">"name"</span>: <span class="tok-str">"𝓖𝓮𝓶𝓲𝓷𝓲 3.8 Flash"</span>,
+      <span class="tok-key">"url"</span>: <span class="tok-str">"https://proxy.ai.sesh.top/v1/chat/completions"</span>,
+      <span class="tok-key">"toolCalling"</span>: <span class="tok-num">true</span>,
+      <span class="tok-key">"vision"</span>: <span class="tok-num">true</span>,
+      <span class="tok-key">"supportsReasoningEffort"</span>: [<span class="tok-str">"none"</span>, <span class="tok-str">"low"</span>, <span class="tok-str">"medium"</span>, <span class="tok-str">"high"</span>],
+      <span class="tok-key">"reasoningEffortFormat"</span>: <span class="tok-str">"chat-completions"</span>,
+      <span class="tok-key">"maxInputTokens"</span>: <span class="tok-num">128000</span>,
+      <span class="tok-key">"maxOutputTokens"</span>: <span class="tok-num">16000</span>
+    }
+  ]
+}</pre>
+        </div>
+    </section>
+
+</main>
+
+<footer>
+    <div class="wrap footer-inner">
+        <span>© <span id="year">2026</span> WarpGate Project · MIT License</span>
+        <span><a href="https://github.com/Neuxbane/Ollama-One" target="_blank" rel="noopener">github.com/Neuxbane/Ollama-One</a></span>
+    </div>
+</footer>
+
+<script>
+    document.getElementById('year').textContent = new Date().getFullYear();
+</script>
+</body>
+</html>

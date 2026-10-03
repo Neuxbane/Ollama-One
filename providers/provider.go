@@ -99,6 +99,10 @@ type CompletionRequest struct {
 	Tools             []Tool          `json:"tools,omitempty"`
 	Stream            bool            `json:"stream"`
 	Thinking          *ThinkingConfig `json:"thinking,omitempty"`
+	Temperature       *float64        `json:"temperature,omitempty"`
+	TopP              *float64        `json:"top_p,omitempty"`
+	MaxTokens         *int            `json:"max_tokens,omitempty"`
+	Metadata          map[string]any  `json:"metadata,omitempty"`
 }
 
 // CompletionResponse defines the output for a chat completion

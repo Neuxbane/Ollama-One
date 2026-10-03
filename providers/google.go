@@ -1841,6 +1841,16 @@ func (p *GoogleProvider) readLiveStream(ctx context.Context, conn *websocket.Con
 						keepConnOpen = true
 						return
 					}
+
+					// A bare generationComplete is NOT the end of the interaction when
+					// tools are declared. The Live API emits generationComplete, then a
+					// turnComplete carrying interactionStatus "IN_PROGRESS", and only
+					// afterwards the toolCall frame (observed on
+					// gemini-3.8-live-extended-thinking). Returning on the bare
+					// generationComplete would drop the function call entirely.
+					if frame.ServerContent.GenerationComplete && !frame.ServerContent.TurnComplete && len(req.Tools) > 0 {
+						continue
+					}
 					if frame.ServerContent.InteractionStatus == "IN_PROGRESS" {
 						continue
 					}
