@@ -1360,6 +1360,34 @@ func sanitizeGeminiSchemaMap(m map[string]any) map[string]any {
 	return m
 }
 
+// isInvalidGeminiPropertyName reports whether a JSON-Schema property name is a
+// non-standard extension key that Gemini's closed Schema message rejects.
+// MCP clients (Cursor, Claude Desktop, etc.) inject synthetic properties such as
+// "x-mcp-header" to pass HTTP headers to MCP servers; these must be stripped
+// before the schema is sent to Gemini, otherwise the Live API closes the
+// WebSocket with code 1007 ("Unknown name ...").
+func isInvalidGeminiPropertyName(name string) bool {
+	if name == "" {
+		return true
+	}
+	// Extension keys use the "x-" prefix convention (e.g. x-mcp-header).
+	if strings.HasPrefix(strings.ToLower(name), "x-") {
+		return true
+	}
+	// Property names must be valid identifiers; anything else is not a real
+	// argument and would be rejected by Gemini.
+	for i, r := range name {
+		if r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			continue
+		}
+		if i > 0 && r >= '0' && r <= '9' {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func sanitizeGeminiSchema(val any) any {
 	switch v := val.(type) {
 	case map[string]any:
@@ -1369,6 +1397,20 @@ func sanitizeGeminiSchema(val any) any {
 			case "$comment", "$schema", "$id", "title", "enumDescriptions", "examples", "default", "additionalProperties",
 				"pattern", "format", "minLength", "maxLength", "minimum", "maximum", "minItems", "maxItems", "uniqueItems":
 				continue
+			}
+			// Filter out non-standard property names inside a "properties" map.
+			if k == "properties" {
+				if propsMap, ok := child.(map[string]any); ok {
+					filtered := make(map[string]any, len(propsMap))
+					for propName, propSchema := range propsMap {
+						if isInvalidGeminiPropertyName(propName) {
+							continue
+						}
+						filtered[propName] = sanitizeGeminiSchema(propSchema)
+					}
+					cleaned[k] = filtered
+					continue
+				}
 			}
 			cleaned[k] = sanitizeGeminiSchema(child)
 		}

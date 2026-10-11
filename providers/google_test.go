@@ -75,6 +75,40 @@ func TestSanitizeGeminiSchema(t *testing.T) {
 	}
 }
 
+func TestSanitizeGeminiSchemaStripsMCPHeader(t *testing.T) {
+	// MCP clients inject synthetic properties like "x-mcp-header" into tool
+	// schemas. Gemini's closed Schema message rejects unknown names, closing
+	// the Live WebSocket with code 1007. Ensure they are stripped.
+	input := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"x-mcp-header": map[string]any{
+				"type":        "string",
+				"description": "MCP transport header",
+			},
+			"query": map[string]any{
+				"type": "string",
+			},
+		},
+		"required": []any{"x-mcp-header", "query"},
+	}
+
+	cleaned := sanitizeGeminiSchemaMap(input)
+
+	props := cleaned["properties"].(map[string]any)
+	if _, exists := props["x-mcp-header"]; exists {
+		t.Errorf("Expected x-mcp-header property to be stripped")
+	}
+	if _, exists := props["query"]; !exists {
+		t.Errorf("Expected query property to be preserved")
+	}
+
+	req, _ := cleaned["required"].([]any)
+	if len(req) != 1 || req[0] != "query" {
+		t.Errorf("Expected required to only contain 'query', got %v", req)
+	}
+}
+
 func TestFixToolCall(t *testing.T) {
 	p := NewGoogleProvider([]string{"dummy"})
 
